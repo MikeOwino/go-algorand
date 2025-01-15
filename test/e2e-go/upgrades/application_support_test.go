@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2022 Algorand, Inc.
+// Copyright (C) 2019-2025 Algorand, Inc.
 // This file is part of go-algorand
 //
 // go-algorand is free software: you can redistribute it and/or modify
@@ -85,7 +85,7 @@ func TestApplicationsUpgradeOverREST(t *testing.T) {
 	a := require.New(fixtures.SynchronizedTest(t))
 
 	client := fixture.GetLibGoalClientForNamedNode("Node")
-	accountList, err := fixture.GetNodeWalletsSortedByBalance(client.DataDir())
+	accountList, err := fixture.GetNodeWalletsSortedByBalance(client)
 	a.NoError(err)
 
 	creator := accountList[0].Address
@@ -180,7 +180,7 @@ int 1
 		curStatus, err = client.Status()
 		a.NoError(err)
 
-		a.Less(int64(time.Now().Sub(startLoopTime)), int64(3*time.Minute))
+		a.Less(int64(time.Since(startLoopTime)), int64(3*time.Minute))
 		time.Sleep(time.Duration(smallLambdaMs) * time.Millisecond)
 	}
 
@@ -328,7 +328,7 @@ func TestApplicationsUpgradeOverGossip(t *testing.T) {
 
 	defer fixture.Shutdown()
 
-	accountList, err := fixture.GetNodeWalletsSortedByBalance(client.DataDir())
+	accountList, err := fixture.GetNodeWalletsSortedByBalance(client)
 	a.NoError(err)
 
 	creator := accountList[0].Address
@@ -438,7 +438,7 @@ int 1
 		curStatus, err = client.Status()
 		a.NoError(err)
 
-		a.Less(int64(time.Now().Sub(startLoopTime)), int64(3*time.Minute))
+		a.Less(int64(time.Since(startLoopTime)), int64(3*time.Minute))
 		time.Sleep(time.Duration(smallLambdaMs) * time.Millisecond)
 		round = curStatus.LastRound
 	}
@@ -448,18 +448,14 @@ int 1
 	a.NoError(err)
 	signedTxn, err = client.SignTransactionWithWallet(wh, nil, tx)
 	a.NoError(err)
-	_, err = client.BroadcastTransaction(signedTxn)
+	txid, err := client.BroadcastTransaction(signedTxn)
 	a.NoError(err)
 
-	curStatus, err = client.Status()
+	// Try polling 10 rounds to ensure txn is committed.
+	round, err = client.CurrentRound()
 	a.NoError(err)
-
-	round = curStatus.LastRound
-
-	client.WaitForRound(round + 2)
-	pendingTx, err = client.GetPendingTransactions(1)
-	a.NoError(err)
-	a.Equal(uint64(0), pendingTx.TotalTransactions)
+	isCommitted := fixture.WaitForTxnConfirmation(round+10, txid)
+	a.True(isCommitted)
 
 	// check creator's balance record for the app entry and the state changes
 	ad, err = client.AccountData(creator)

@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2022 Algorand, Inc.
+// Copyright (C) 2019-2025 Algorand, Inc.
 // This file is part of go-algorand
 //
 // go-algorand is free software: you can redistribute it and/or modify
@@ -20,13 +20,24 @@ import (
 	"encoding/base64"
 	"errors"
 	"math"
+	"slices"
 	"sort"
 
 	"github.com/algorand/go-algorand/config"
 	"github.com/algorand/go-algorand/crypto"
+	"github.com/algorand/go-algorand/crypto/merklesignature"
 	"github.com/algorand/go-algorand/daemon/algod/api/server/v2/generated/model"
 	"github.com/algorand/go-algorand/data/basics"
 )
+
+// AssetHolding converts between basics.AssetHolding and model.AssetHolding
+func AssetHolding(ah basics.AssetHolding, ai basics.AssetIndex) model.AssetHolding {
+	return model.AssetHolding{
+		Amount:   ah.Amount,
+		AssetID:  uint64(ai),
+		IsFrozen: ah.Frozen,
+	}
+}
 
 // AccountDataToAccount converts basics.AccountData to v2.model.Account
 func AccountDataToAccount(
@@ -39,11 +50,7 @@ func AccountDataToAccount(
 	for curid, holding := range record.Assets {
 		// Empty is ok, asset may have been deleted, so we can no
 		// longer fetch the creator
-		holding := model.AssetHolding{
-			Amount:   holding.Amount,
-			AssetID:  uint64(curid),
-			IsFrozen: holding.Frozen,
-		}
+		holding := AssetHolding(holding, curid)
 
 		assets = append(assets, holding)
 	}
@@ -61,7 +68,7 @@ func AccountDataToAccount(
 	})
 
 	var apiParticipation *model.AccountParticipation
-	if record.VoteID != (crypto.OneTimeSignatureVerifier{}) {
+	if !record.VoteID.IsEmpty() {
 		apiParticipation = &model.AccountParticipation{
 			VoteParticipationKey:      record.VoteID[:],
 			SelectionParticipationKey: record.SelectionID[:],
@@ -86,15 +93,7 @@ func AccountDataToAccount(
 
 	appsLocalState := make([]model.ApplicationLocalState, 0, len(record.AppLocalStates))
 	for appIdx, state := range record.AppLocalStates {
-		localState := convertTKVToGenerated(&state.KeyValue)
-		appsLocalState = append(appsLocalState, model.ApplicationLocalState{
-			Id:       uint64(appIdx),
-			KeyValue: localState,
-			Schema: model.ApplicationStateSchema{
-				NumByteSlice: state.Schema.NumByteSlice,
-				NumUint:      state.Schema.NumUint,
-			},
-		})
+		appsLocalState = append(appsLocalState, AppLocalState(state, appIdx))
 	}
 	sort.Slice(appsLocalState, func(i, j int) bool {
 		return appsLocalState[i].Id < appsLocalState[j].Id
@@ -125,6 +124,7 @@ func AccountDataToAccount(
 		Status:                      record.Status.String(),
 		RewardBase:                  &record.RewardsBase,
 		Participation:               apiParticipation,
+		IncentiveEligible:           omitEmpty(record.IncentiveEligible),
 		CreatedAssets:               &createdAssets,
 		TotalCreatedAssets:          uint64(len(createdAssets)),
 		CreatedApps:                 &createdApps,
@@ -135,10 +135,12 @@ func AccountDataToAccount(
 		AppsLocalState:              &appsLocalState,
 		TotalAppsOptedIn:            uint64(len(appsLocalState)),
 		AppsTotalSchema:             &totalAppSchema,
-		AppsTotalExtraPages:         numOrNil(totalExtraPages),
-		TotalBoxes:                  numOrNil(record.TotalBoxes),
-		TotalBoxBytes:               numOrNil(record.TotalBoxBytes),
+		AppsTotalExtraPages:         omitEmpty(totalExtraPages),
+		TotalBoxes:                  omitEmpty(record.TotalBoxes),
+		TotalBoxBytes:               omitEmpty(record.TotalBoxBytes),
 		MinBalance:                  minBalance.Raw,
+		LastProposed:                omitEmpty(uint64(record.LastProposed)),
+		LastHeartbeat:               omitEmpty(uint64(record.LastHeartbeat)),
 	}, nil
 }
 
@@ -201,12 +203,16 @@ func AccountToAccountData(a *model.Account) (basics.AccountData, error) {
 	var voteFirstValid basics.Round
 	var voteLastValid basics.Round
 	var voteKeyDilution uint64
+	var stateProofID merklesignature.Commitment
 	if a.Participation != nil {
 		copy(voteID[:], a.Participation.VoteParticipationKey)
 		copy(selID[:], a.Participation.SelectionParticipationKey)
 		voteFirstValid = basics.Round(a.Participation.VoteFirstValid)
 		voteLastValid = basics.Round(a.Participation.VoteLastValid)
 		voteKeyDilution = a.Participation.VoteKeyDilution
+		if a.Participation.StateProofKey != nil {
+			copy(stateProofID[:], *a.Participation.StateProofKey)
+		}
 	}
 
 	var rewardsBase uint64
@@ -342,6 +348,16 @@ func AccountToAccountData(a *model.Account) (basics.AccountData, error) {
 		totalBoxBytes = *a.TotalBoxBytes
 	}
 
+	var lastProposed uint64
+	if a.LastProposed != nil {
+		lastProposed = *a.LastProposed
+	}
+
+	var lastHeartbeat uint64
+	if a.LastHeartbeat != nil {
+		lastHeartbeat = *a.LastHeartbeat
+	}
+
 	status, err := basics.UnmarshalStatus(a.Status)
 	if err != nil {
 		return basics.AccountData{}, err
@@ -352,11 +368,13 @@ func AccountToAccountData(a *model.Account) (basics.AccountData, error) {
 		MicroAlgos:         basics.MicroAlgos{Raw: a.Amount},
 		RewardsBase:        rewardsBase,
 		RewardedMicroAlgos: basics.MicroAlgos{Raw: a.Rewards},
+		IncentiveEligible:  nilToZero(a.IncentiveEligible),
 		VoteID:             voteID,
 		SelectionID:        selID,
 		VoteFirstValid:     voteFirstValid,
 		VoteLastValid:      voteLastValid,
 		VoteKeyDilution:    voteKeyDilution,
+		StateProofID:       stateProofID,
 		Assets:             assets,
 		AppLocalStates:     appLocalStates,
 		AppParams:          appParams,
@@ -364,6 +382,8 @@ func AccountToAccountData(a *model.Account) (basics.AccountData, error) {
 		TotalExtraAppPages: totalExtraPages,
 		TotalBoxes:         totalBoxes,
 		TotalBoxBytes:      totalBoxBytes,
+		LastProposed:       basics.Round(lastProposed),
+		LastHeartbeat:      basics.Round(lastHeartbeat),
 	}
 
 	if a.AuthAddr != nil {
@@ -432,7 +452,7 @@ func AppParamsToApplication(creator string, appIdx basics.AppIndex, appParams *b
 			Creator:           creator,
 			ApprovalProgram:   appParams.ApprovalProgram,
 			ClearStateProgram: appParams.ClearStateProgram,
-			ExtraProgramPages: numOrNil(extraProgramPages),
+			ExtraProgramPages: omitEmpty(extraProgramPages),
 			GlobalState:       globalState,
 			LocalStateSchema: &model.ApplicationStateSchema{
 				NumByteSlice: appParams.LocalStateSchema.NumByteSlice,
@@ -447,6 +467,19 @@ func AppParamsToApplication(creator string, appIdx basics.AppIndex, appParams *b
 	return app
 }
 
+// AppLocalState converts between basics.AppLocalState and model.ApplicationLocalState
+func AppLocalState(state basics.AppLocalState, appIdx basics.AppIndex) model.ApplicationLocalState {
+	localState := convertTKVToGenerated(&state.KeyValue)
+	return model.ApplicationLocalState{
+		Id:       uint64(appIdx),
+		KeyValue: localState,
+		Schema: model.ApplicationStateSchema{
+			NumByteSlice: state.Schema.NumByteSlice,
+			NumUint:      state.Schema.NumUint,
+		},
+	}
+}
+
 // AssetParamsToAsset converts basics.AssetParams to model.Asset
 func AssetParamsToAsset(creator string, idx basics.AssetIndex, params *basics.AssetParams) model.Asset {
 	frozen := params.DefaultFrozen
@@ -455,20 +488,19 @@ func AssetParamsToAsset(creator string, idx basics.AssetIndex, params *basics.As
 		Total:         params.Total,
 		Decimals:      uint64(params.Decimals),
 		DefaultFrozen: &frozen,
-		Name:          strOrNil(printableUTF8OrEmpty(params.AssetName)),
-		NameB64:       byteOrNil([]byte(params.AssetName)),
-		UnitName:      strOrNil(printableUTF8OrEmpty(params.UnitName)),
-		UnitNameB64:   byteOrNil([]byte(params.UnitName)),
-		Url:           strOrNil(printableUTF8OrEmpty(params.URL)),
-		UrlB64:        byteOrNil([]byte(params.URL)),
+		Name:          omitEmpty(printableUTF8OrEmpty(params.AssetName)),
+		NameB64:       sliceOrNil([]byte(params.AssetName)),
+		UnitName:      omitEmpty(printableUTF8OrEmpty(params.UnitName)),
+		UnitNameB64:   sliceOrNil([]byte(params.UnitName)),
+		Url:           omitEmpty(printableUTF8OrEmpty(params.URL)),
+		UrlB64:        sliceOrNil([]byte(params.URL)),
 		Clawback:      addrOrNil(params.Clawback),
 		Freeze:        addrOrNil(params.Freeze),
 		Manager:       addrOrNil(params.Manager),
 		Reserve:       addrOrNil(params.Reserve),
 	}
 	if params.MetadataHash != ([32]byte{}) {
-		metadataHash := make([]byte, len(params.MetadataHash))
-		copy(metadataHash, params.MetadataHash[:])
+		metadataHash := slices.Clone(params.MetadataHash[:])
 		assetParams.MetadataHash = &metadataHash
 	}
 

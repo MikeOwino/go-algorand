@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2022 Algorand, Inc.
+// Copyright (C) 2019-2025 Algorand, Inc.
 // This file is part of go-algorand
 //
 // go-algorand is free software: you can redistribute it and/or modify
@@ -78,7 +78,7 @@ var netCmd = &cobra.Command{
 		if relayAddress != "" {
 			addrs = []string{relayAddress}
 		} else {
-			addrs, err = tools.ReadFromSRV("algobootstrap", "tcp", networkName, "", false)
+			addrs, err = tools.ReadFromSRV(context.Background(), "algobootstrap", "tcp", networkName, "", false)
 			if err != nil || len(addrs) == 0 {
 				reportErrorf("Unable to bootstrap records for '%s' : %v", networkName, err)
 			}
@@ -314,8 +314,8 @@ func loadAndDump(addr string, tarFile string, genesisInitState ledgercore.InitSt
 	}
 
 	defer func() {
-		if err := deleteLedgerFiles(!loadOnly); err != nil {
-			reportWarnf("Error deleting ledger files: %v", err)
+		if delErr := deleteLedgerFiles(!loadOnly); delErr != nil {
+			reportWarnf("Error deleting ledger files: %v", delErr)
 		}
 	}()
 	defer l.Close()
@@ -353,15 +353,26 @@ func loadAndDump(addr string, tarFile string, genesisInitState ledgercore.InitSt
 			return err
 		}
 		defer outFile.Close()
-		err = printAccountsDatabase("./ledger.tracker.sqlite", fileHeader, outFile, excludedFields.GetSlice())
+		err = printAccountsDatabase("./ledger.tracker.sqlite", true, fileHeader, outFile, excludedFields.GetSlice())
 		if err != nil {
 			return err
 		}
-		err = printKeyValueStore("./ledger.tracker.sqlite", outFile)
+		err = printKeyValueStore("./ledger.tracker.sqlite", true, outFile)
 		if err != nil {
 			return err
 		}
-
+		err = printStateProofVerificationContext("./ledger.tracker.sqlite", true, outFile)
+		if err != nil {
+			return err
+		}
+		err = printOnlineAccounts("./ledger.tracker.sqlite", true, outFile)
+		if err != nil {
+			return err
+		}
+		err = printOnlineRoundParams("./ledger.tracker.sqlite", true, outFile)
+		if err != nil {
+			return err
+		}
 	}
 	return nil
 }

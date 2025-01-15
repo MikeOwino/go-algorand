@@ -1,7 +1,7 @@
 #!/bin/bash
 # shellcheck disable=2009,2093,2164
 
-UPDATER_MIN_VERSION="3.8.0"
+UPDATER_MIN_VERSION="3.12.2"
 UPDATER_CHANNEL="stable"
 FILENAME=$(basename -- "$0")
 SCRIPTPATH="$( cd "$(dirname "$0")" ; pwd -P )"
@@ -185,10 +185,6 @@ function get_updater_url() {
         UNAME=$(uname -m)
         if [[ "${UNAME}" = "x86_64" ]]; then
             ARCH="amd64"
-        elif [[ "${UNAME}" = "armv6l" ]]; then
-            ARCH="arm"
-        elif [[ "${UNAME}" = "armv7l" ]]; then
-            ARCH="arm"
         elif [[ "${UNAME}" = "aarch64" ]]; then
             ARCH="arm64"
         else
@@ -334,7 +330,7 @@ function check_for_updater() {
 function check_for_update() {
     determine_current_version
     check_for_updater
-    LATEST="$(${SCRIPTPATH}/updater ver check -c ${CHANNEL} ${BUCKET} | sed -n '2 p')"
+    LATEST="$(${SCRIPTPATH}/updater ver check -c ${CHANNEL} ${BUCKET} | tail -1)"
     if [ $? -ne 0 ]; then
         echo "No remote updates found"
         return 1
@@ -537,7 +533,7 @@ function install_new_binaries() {
     if [ ! -d ${UPDATESRCDIR}/bin ]; then
         return 0
     else
-        echo "Installing new binary files..."
+        echo "Installing new binary files into ${BINDIR}"
         ROLLBACKBIN=1
         rm -rf ${BINDIR}/new
         mkdir ${BINDIR}/new

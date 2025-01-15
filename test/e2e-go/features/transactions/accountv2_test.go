@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2022 Algorand, Inc.
+// Copyright (C) 2019-2025 Algorand, Inc.
 // This file is part of go-algorand
 //
 // go-algorand is free software: you can redistribute it and/or modify
@@ -114,7 +114,7 @@ func TestAccountInformationV2(t *testing.T) {
 
 	round, err := client.CurrentRound()
 	a.NoError(err)
-	fixture.WaitForConfirmedTxn(round+4, creator, txn.ID().String())
+	fixture.WaitForConfirmedTxn(round+4, txn.ID().String())
 
 	// There should be no apps to start with
 	ad, err := client.AccountData(creator)
@@ -312,7 +312,7 @@ int 1
 		resp, err := client.GetParsedPendingTransactions(2)
 		a.NoError(err)
 		if resp.TotalTransactions == 1 {
-			a.Equal(resp.TopTransactions[0].Txn.ID(), txid)
+			a.Equal(resp.TopTransactions[0].Txn.ID().String(), txid)
 			continue
 		}
 		a.Equal(uint64(0), resp.TotalTransactions)
@@ -419,7 +419,7 @@ func accountInformationCheckWithOffendingFields(t *testing.T,
 
 	round, err := client.CurrentRound()
 	a.NoError(err)
-	fixture.WaitForConfirmedTxn(round+4, creator, txn.ID().String())
+	fixture.WaitForConfirmedTxn(round+4, txn.ID().String())
 
 	// There should be no apps to start with
 	ad, err := client.AccountData(creator)

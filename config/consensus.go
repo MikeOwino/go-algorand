@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2022 Algorand, Inc.
+// Copyright (C) 2019-2025 Algorand, Inc.
 // This file is part of go-algorand
 //
 // go-algorand is free software: you can redistribute it and/or modify
@@ -112,6 +112,14 @@ type ConsensusParams struct {
 	// rather than check each individual app call is within the budget.
 	EnableAppCostPooling bool
 
+	// EnableLogicSigCostPooling specifies LogicSig budgets are pooled across a
+	// group. The total available is len(group) * LogicSigMaxCost
+	EnableLogicSigCostPooling bool
+
+	// EnableLogicSigSizePooling specifies LogicSig sizes are pooled across a
+	// group. The total available is len(group) * LogicSigMaxSize
+	EnableLogicSigSizePooling bool
+
 	// RewardUnit specifies the number of MicroAlgos corresponding to one reward
 	// unit.
 	//
@@ -158,6 +166,8 @@ type ConsensusParams struct {
 	// time for nodes to wait for block proposal headers for period = 0, value should be configured to suit best case
 	// critical path
 	AgreementFilterTimeoutPeriod0 time.Duration
+	// Duration of the second agreement step for period=0, value should be configured to suit best case critical path
+	AgreementDeadlineTimeoutPeriod0 time.Duration
 
 	FastRecoveryLambda time.Duration // time between fast recovery attempts
 
@@ -222,7 +232,7 @@ type ConsensusParams struct {
 	// 0 for no support, otherwise highest version supported
 	LogicSigVersion uint64
 
-	// len(LogicSig.Logic) + len(LogicSig.Args[*]) must be less than this
+	// len(LogicSig.Logic) + len(LogicSig.Args[*]) must be less than this (unless pooling is enabled)
 	LogicSigMaxSize uint64
 
 	// sum of estimated op cost must be less than this
@@ -415,6 +425,11 @@ type ConsensusParams struct {
 	// their account balances.
 	StateProofExcludeTotalWeightWithRewards bool
 
+	// StateProofBlockHashInLightHeader specifies that the LightBlockHeader
+	// committed to by state proofs should contain the BlockHash of each
+	// block, instead of the seed.
+	StateProofBlockHashInLightHeader bool
+
 	// EnableAssetCloseAmount adds an extra field to the ApplyData. The field contains the amount of the remaining
 	// asset that were sent to the close-to address.
 	EnableAssetCloseAmount bool
@@ -436,8 +451,8 @@ type ConsensusParams struct {
 
 	EnableExtraPagesOnAppUpdate bool
 
-	// MaxProposedExpiredOnlineAccounts is the maximum number of online accounts, which need
-	// to be taken offline, that would be proposed to be taken offline.
+	// MaxProposedExpiredOnlineAccounts is the maximum number of online accounts
+	// that a proposer can take offline for having expired voting keys.
 	MaxProposedExpiredOnlineAccounts int
 
 	// EnableAccountDataResourceSeparation enables the support for extended application and asset storage
@@ -483,6 +498,143 @@ type ConsensusParams struct {
 	// the rewardsLevel, but the rewardsLevel has no meaning because the account
 	// has fewer than RewardUnit algos.
 	UnfundedSenders bool
+
+	// EnablePrecheckECDSACurve means that ecdsa_verify opcode will bail early,
+	// returning false, if pubkey is not on the curve.
+	EnablePrecheckECDSACurve bool
+
+	// EnableBareBudgetError specifies that I/O budget overruns should not be considered EvalError
+	EnableBareBudgetError bool
+
+	// StateProofUseTrackerVerification specifies whether the node will use data from state proof verification tracker
+	// in order to verify state proofs.
+	StateProofUseTrackerVerification bool
+
+	// EnableCatchpointsWithSPContexts specifies when to re-enable version 7 catchpoints.
+	// Version 7 includes state proof verification contexts
+	EnableCatchpointsWithSPContexts bool
+
+	// EnableCatchpointsWithOnlineAccounts specifies when to enable version 8 catchpoints.
+	// Version 8 includes onlineaccounts and onlineroundparams amounts, for historical stake lookups.
+	EnableCatchpointsWithOnlineAccounts bool
+
+	// AppForbidLowResources enforces a rule that prevents apps from accessing
+	// asas and apps below 256, in an effort to decrease the ambiguity of
+	// opcodes that accept IDs or slot indexes. Simultaneously, the first ID
+	// allocated in new chains is raised to 1001.
+	AppForbidLowResources bool
+
+	// EnableBoxRefNameError specifies that box ref names should be validated early
+	EnableBoxRefNameError bool
+
+	// ExcludeExpiredCirculation excludes expired stake from the total online stake
+	// used by agreement for Circulation, and updates the calculation of StateProofOnlineTotalWeight used
+	// by state proofs to use the same method (rather than excluding stake from the top N stakeholders as before).
+	ExcludeExpiredCirculation bool
+
+	// DynamicFilterTimeout indicates whether the filter timeout is set
+	// dynamically, at run time, according to the recent history of credential
+	// arrival times or is set to a static value. Even if this flag disables the
+	// dynamic filter, it will be calculated and logged (but not used).
+	DynamicFilterTimeout bool
+
+	// Payouts contains parameters for amounts and eligibility for block proposer
+	// payouts. It excludes information about the "unsustainable" payouts
+	// described in BonusPlan.
+	Payouts ProposerPayoutRules
+
+	// Bonus contains parameters related to the extra payout made to block
+	// proposers, unrelated to the fees paid in that block.  For it to actually
+	// occur, extra funds need to be put into the FeeSink.  The bonus amount
+	// decays exponentially.
+	Bonus BonusPlan
+
+	// Heartbeat support
+	Heartbeat bool
+}
+
+// ProposerPayoutRules puts several related consensus parameters in one place. The same
+// care for backward compatibility with old blocks must be taken.
+type ProposerPayoutRules struct {
+	// Enabled turns on several things needed for paying block incentives,
+	// including tracking of the proposer and fees collected.
+	Enabled bool
+
+	// GoOnlineFee imparts a small cost on moving from offline to online. This
+	// will impose a cost to running unreliable nodes that get suspended and
+	// then come back online.
+	GoOnlineFee uint64
+
+	// Percent specifies the percent of fees paid in a block that go to the
+	// proposer instead of the FeeSink.
+	Percent uint64
+
+	// MinBalance is the minimum balance an account must have to be eligible for
+	// incentives. It ensures that smaller accounts continue to operate for the
+	// same motivations they had before block incentives were
+	// introduced. Without that assurance, it is difficult to model their
+	// behaviour - might many participants join for the hope of easy financial
+	// rewards, but without caring enough to run a high-quality node?
+	MinBalance uint64
+
+	// MaxBalance is the maximum balance an account can have to be eligible for
+	// incentives. It encourages large accounts to split their stake to add
+	// resilience to consensus in the case of outages.  Nothing in protocol can
+	// prevent such accounts from running nodes that share fate (same machine,
+	// same data center, etc), but this serves as a gentle reminder.
+	MaxBalance uint64
+
+	// MaxMarkAbsent is the maximum number of online accounts, that a proposer
+	// can suspend for not proposing "lately" (In 10x expected interval, or
+	// within a grace period from being challenged)
+	MaxMarkAbsent int
+
+	// Challenges occur once every challengeInterval rounds.
+	ChallengeInterval uint64
+	// Suspensions happen between 1 and 2 grace periods after a challenge. Must
+	// be less than half MaxTxnLife to ensure the Block header will be cached
+	// and less than half ChallengeInterval to avoid overlapping challenges. A larger
+	// grace period means larger stake nodes will probably propose before they
+	// need to consider an active heartbeat.
+	ChallengeGracePeriod uint64
+	// An account is challenged if the first challengeBits match the start of
+	// the account address. An online account will be challenged about once
+	// every interval*2^bits rounds.
+	ChallengeBits int
+}
+
+// BonusPlan describes how the "extra" proposer payouts are to be made.  It
+// specifies an exponential decay in which the bonus decreases by 1% every n
+// rounds.  If we need to change the decay rate (only), we would create a new
+// plan like:
+//
+//	BaseAmount: 0, DecayInterval: XXX
+//
+// by using a zero baseAmount, the amount is not affected.
+// For a bigger change, we'd use a plan like:
+//
+//	BaseRound:  <FUTURE round>, BaseAmount: <new amount>, DecayInterval: <new>
+//
+// or just
+//
+//	BaseAmount: <new amount>, DecayInterval: <new>
+//
+// the new decay rate would go into effect at upgrade time, and the new
+// amount would be set at baseRound or at upgrade time.
+type BonusPlan struct {
+	// BaseRound is the earliest round this plan can apply. Of course, the
+	// consensus update must also have happened. So using a low value makes it
+	// go into effect immediately upon upgrade.
+	BaseRound uint64
+	// BaseAmount is the bonus to be paid when this plan first applies (see
+	// baseRound). If it is zero, then no explicit change is made to the bonus
+	// (useful for only changing the decay rate).
+	BaseAmount uint64
+	// DecayInterval is the time in rounds between 1% decays. For simplicity,
+	// decay occurs based on round % BonusDecayInterval, so a decay can happen right
+	// after going into effect. The BonusDecayInterval goes into effect at upgrade
+	// time, regardless of `baseRound`.
+	DecayInterval uint64
 }
 
 // PaysetCommitType enumerates possible ways for the block header to commit to
@@ -554,12 +706,52 @@ var MaxBytesKeyValueLen int
 var MaxExtraAppProgramLen int
 
 // MaxAvailableAppProgramLen is the largest supported app program size include the extra pages
-//supported supported by any of the consensus protocols. used for decoding purposes.
+// supported supported by any of the consensus protocols. used for decoding purposes.
 var MaxAvailableAppProgramLen int
 
-// MaxProposedExpiredOnlineAccounts is the maximum number of online accounts, which need
-// to be taken offline, that would be proposed to be taken offline.
+// MaxProposedExpiredOnlineAccounts is the maximum number of online accounts
+// that a proposer can take offline for having expired voting keys.
 var MaxProposedExpiredOnlineAccounts int
+
+// MaxMarkAbsent is the maximum number of online accounts that a proposer can
+// suspend for not proposing "lately"
+var MaxMarkAbsent int
+
+// MaxAppTotalArgLen is the maximum number of bytes across all arguments of an application
+// max sum([len(arg) for arg in txn.ApplicationArgs])
+var MaxAppTotalArgLen int
+
+// MaxAssetNameBytes is the maximum asset name length in bytes
+var MaxAssetNameBytes int
+
+// MaxAssetUnitNameBytes is the maximum asset unit name length in bytes
+var MaxAssetUnitNameBytes int
+
+// MaxAssetURLBytes is the maximum asset URL length in bytes
+var MaxAssetURLBytes int
+
+// MaxAppBytesValueLen is the maximum length of a bytes value used in an application's global or
+// local key/value store
+var MaxAppBytesValueLen int
+
+// MaxAppBytesKeyLen is the maximum length of a key used in an application's global or local
+// key/value store
+var MaxAppBytesKeyLen int
+
+// StateProofTopVoters is a bound on how many online accounts get to
+// participate in forming the state proof, by including the
+// top StateProofTopVoters accounts (by normalized balance) into the
+// vector commitment.
+var StateProofTopVoters int
+
+// MaxTxnBytesPerBlock determines the maximum number of bytes
+// that transactions can take up in a block.  Specifically,
+// the sum of the lengths of encodings of each transaction
+// in a block must not exceed MaxTxnBytesPerBlock.
+var MaxTxnBytesPerBlock int
+
+// MaxAppTxnForeignApps is the max number of foreign apps per txn across all consensus versions
+var MaxAppTxnForeignApps int
 
 func checkSetMax(value int, curMax *int) {
 	if value > *curMax {
@@ -584,7 +776,7 @@ func checkSetAllocBounds(p ConsensusParams) {
 	checkSetMax(p.MaxAppProgramLen, &MaxStateDeltaKeys)
 	checkSetMax(p.MaxAppProgramLen, &MaxEvalDeltaAccounts)
 	checkSetMax(p.MaxAppProgramLen, &MaxAppProgramLen)
-	checkSetMax(int(p.LogicSigMaxSize), &MaxLogicSigMaxSize)
+	checkSetMax((int(p.LogicSigMaxSize) * p.MaxTxGroupSize), &MaxLogicSigMaxSize)
 	checkSetMax(p.MaxTxnNoteBytes, &MaxTxnNoteBytes)
 	checkSetMax(p.MaxTxGroupSize, &MaxTxGroupSize)
 	// MaxBytesKeyValueLen is max of MaxAppKeyLen and MaxAppBytesValueLen
@@ -598,6 +790,20 @@ func checkSetAllocBounds(p ConsensusParams) {
 	checkSetMax(p.MaxAppProgramLen, &MaxLogCalls)
 	checkSetMax(p.MaxInnerTransactions*p.MaxTxGroupSize, &MaxInnerTransactionsPerDelta)
 	checkSetMax(p.MaxProposedExpiredOnlineAccounts, &MaxProposedExpiredOnlineAccounts)
+	checkSetMax(p.Payouts.MaxMarkAbsent, &MaxMarkAbsent)
+
+	// These bounds are exported to make them available to the msgp generator for calculating
+	// maximum valid message size for each message going across the wire.
+	checkSetMax(p.MaxAppTotalArgLen, &MaxAppTotalArgLen)
+	checkSetMax(p.MaxAssetNameBytes, &MaxAssetNameBytes)
+	checkSetMax(p.MaxAssetUnitNameBytes, &MaxAssetUnitNameBytes)
+	checkSetMax(p.MaxAssetURLBytes, &MaxAssetURLBytes)
+	checkSetMax(p.MaxAppBytesValueLen, &MaxAppBytesValueLen)
+	checkSetMax(p.MaxAppKeyLen, &MaxAppBytesKeyLen)
+	checkSetMax(int(p.StateProofTopVoters), &StateProofTopVoters)
+	checkSetMax(p.MaxTxnBytesPerBlock, &MaxTxnBytesPerBlock)
+
+	checkSetMax(p.MaxAppTxnForeignApps, &MaxAppTxnForeignApps)
 }
 
 // SaveConfigurableConsensus saves the configurable protocols file to the provided data directory.
@@ -650,7 +856,7 @@ func (cp ConsensusProtocols) Merge(configurableConsensus ConsensusProtocols) Con
 			for cVer, cParam := range staticConsensus {
 				if cVer == consensusVersion {
 					delete(staticConsensus, cVer)
-				} else if _, has := cParam.ApprovedUpgrades[consensusVersion]; has {
+				} else {
 					// delete upgrade to deleted version
 					delete(cParam.ApprovedUpgrades, consensusVersion)
 				}
@@ -671,13 +877,20 @@ func LoadConfigurableConsensusProtocols(dataDirectory string) error {
 		return err
 	}
 	if newConsensus != nil {
-		Consensus = newConsensus
-		// Set allocation limits
-		for _, p := range Consensus {
-			checkSetAllocBounds(p)
-		}
+		SetConfigurableConsensusProtocols(newConsensus)
 	}
 	return nil
+}
+
+// SetConfigurableConsensusProtocols sets the configurable protocols.
+func SetConfigurableConsensusProtocols(newConsensus ConsensusProtocols) ConsensusProtocols {
+	oldConsensus := Consensus
+	Consensus = newConsensus
+	// Set allocation limits
+	for _, p := range Consensus {
+		checkSetAllocBounds(p)
+	}
+	return oldConsensus
 }
 
 // PreloadConfigurableConsensusProtocols loads the configurable protocols from the data directory
@@ -705,6 +918,9 @@ func PreloadConfigurableConsensusProtocols(dataDirectory string) (ConsensusProto
 	return Consensus.Merge(configurableConsensus), nil
 }
 
+// initConsensusProtocols defines the consensus protocol values and how values change across different versions of the protocol.
+//
+// These are the only valid and tested consensus values and transitions. Other settings are not tested and may lead to unexpected behavior.
 func initConsensusProtocols() {
 	// WARNING: copying a ConsensusParams by value into a new variable
 	// does not copy the ApprovedUpgrades map.  Make sure that each new
@@ -745,8 +961,9 @@ func initConsensusProtocols() {
 		DownCommitteeSize:      10000,
 		DownCommitteeThreshold: 7750,
 
-		AgreementFilterTimeout:        4 * time.Second,
-		AgreementFilterTimeoutPeriod0: 4 * time.Second,
+		AgreementFilterTimeout:          4 * time.Second,
+		AgreementFilterTimeoutPeriod0:   4 * time.Second,
+		AgreementDeadlineTimeoutPeriod0: Protocol.BigLambda + Protocol.SmallLambda,
 
 		FastRecoveryLambda: 5 * time.Minute,
 
@@ -1243,12 +1460,100 @@ func initConsensusProtocols() {
 
 	v35.ApprovedUpgrades[protocol.ConsensusV36] = 140000
 
+	v37 := v36
+	v37.ApprovedUpgrades = map[protocol.ConsensusVersion]uint64{}
+
+	Consensus[protocol.ConsensusV37] = v37
+
+	// v36 can be upgraded to v37, with an update delay of 7 days ( see calculation above )
+	v36.ApprovedUpgrades[protocol.ConsensusV37] = 140000
+
+	v38 := v37
+	v38.ApprovedUpgrades = map[protocol.ConsensusVersion]uint64{}
+
+	// enables state proof recoverability
+	v38.StateProofUseTrackerVerification = true
+	v38.EnableCatchpointsWithSPContexts = true
+
+	// online circulation on-demand expiration
+	v38.ExcludeExpiredCirculation = true
+
+	// TEAL resources sharing and other features
+	v38.LogicSigVersion = 9
+	v38.EnablePrecheckECDSACurve = true
+	v38.AppForbidLowResources = true
+	v38.EnableBareBudgetError = true
+	v38.EnableBoxRefNameError = true
+
+	v38.AgreementFilterTimeoutPeriod0 = 3000 * time.Millisecond
+
+	Consensus[protocol.ConsensusV38] = v38
+
+	// v37 can be upgraded to v38, with an update delay of 12h:
+	// 10046 = (12 * 60 * 60 / 4.3)
+	// for the sake of future manual calculations, we'll round that down a bit :
+	v37.ApprovedUpgrades[protocol.ConsensusV38] = 10000
+
+	v39 := v38
+	v39.ApprovedUpgrades = map[protocol.ConsensusVersion]uint64{}
+
+	v39.LogicSigVersion = 10
+	v39.EnableLogicSigCostPooling = true
+
+	v39.AgreementDeadlineTimeoutPeriod0 = 4 * time.Second
+
+	v39.DynamicFilterTimeout = true
+
+	v39.StateProofBlockHashInLightHeader = true
+
+	// For future upgrades, round times will likely be shorter so giving ourselves some buffer room
+	v39.MaxUpgradeWaitRounds = 250000
+
+	Consensus[protocol.ConsensusV39] = v39
+
+	// v38 can be upgraded to v39, with an update delay of 7d:
+	// 157000 = (7 * 24 * 60 * 60 / 3.3 round times currently)
+	// but our current max is 150000 so using that :
+	v38.ApprovedUpgrades[protocol.ConsensusV39] = 150000
+
+	v40 := v39
+	v40.ApprovedUpgrades = map[protocol.ConsensusVersion]uint64{}
+
+	v40.LogicSigVersion = 11
+
+	v40.EnableLogicSigSizePooling = true
+
+	v40.Payouts.Enabled = true
+	v40.Payouts.Percent = 50
+	v40.Payouts.GoOnlineFee = 2_000_000         // 2 algos
+	v40.Payouts.MinBalance = 30_000_000_000     // 30,000 algos
+	v40.Payouts.MaxBalance = 70_000_000_000_000 // 70M algos
+	v40.Payouts.MaxMarkAbsent = 32
+	v40.Payouts.ChallengeInterval = 1000
+	v40.Payouts.ChallengeGracePeriod = 200
+	v40.Payouts.ChallengeBits = 5
+
+	v40.Bonus.BaseAmount = 10_000_000 // 10 Algos
+	// 2.9 sec rounds gives about 10.8M rounds per year.
+	v40.Bonus.DecayInterval = 1_000_000 // .99^(10.8M/1M) ~ .897. So ~10% decay per year
+
+	v40.Heartbeat = true
+
+	v40.EnableCatchpointsWithOnlineAccounts = true
+
+	Consensus[protocol.ConsensusV40] = v40
+
+	// v39 can be upgraded to v40, with an update delay of 7d:
+	// 208000 = (7 * 24 * 60 * 60 / 2.9 ballpark round times)
+	// our current max is 250000
+	v39.ApprovedUpgrades[protocol.ConsensusV40] = 208000
+
 	// ConsensusFuture is used to test features that are implemented
 	// but not yet released in a production protocol version.
-	vFuture := v36
+	vFuture := v40
 	vFuture.ApprovedUpgrades = map[protocol.ConsensusVersion]uint64{}
 
-	vFuture.LogicSigVersion = 9 // When moving this to a release, put a new higher LogicSigVersion here
+	vFuture.LogicSigVersion = 12 // When moving this to a release, put a new higher LogicSigVersion here
 
 	Consensus[protocol.ConsensusFuture] = vFuture
 
@@ -1282,6 +1587,23 @@ func initConsensusProtocols() {
 	vAlpha5.ApprovedUpgrades = map[protocol.ConsensusVersion]uint64{}
 	Consensus[protocol.ConsensusVAlpha5] = vAlpha5
 	vAlpha4.ApprovedUpgrades[protocol.ConsensusVAlpha5] = 10000
+}
+
+// ApplyShorterUpgradeRoundsForDevNetworks applies a shorter upgrade round time for the Devnet and Betanet networks.
+// This function should not take precedence over settings loaded via `PreloadConfigurableConsensusProtocols`.
+func ApplyShorterUpgradeRoundsForDevNetworks(id protocol.NetworkID) {
+	if id == Betanet || id == Devnet {
+		// Go through all approved upgrades and set to the MinUpgradeWaitRounds valid where MinUpgradeWaitRounds is set
+		for _, p := range Consensus {
+			if p.ApprovedUpgrades != nil {
+				for v := range p.ApprovedUpgrades {
+					if p.MinUpgradeWaitRounds > 0 {
+						p.ApprovedUpgrades[v] = p.MinUpgradeWaitRounds
+					}
+				}
+			}
+		}
+	}
 }
 
 // Global defines global Algorand protocol parameters which should not be overridden.

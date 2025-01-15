@@ -134,6 +134,9 @@ type Logger interface {
 	// Set the logging version (Info by default)
 	SetLevel(Level)
 
+	// Get the logging version
+	GetLevel() Level
+
 	// Sets the output target
 	SetOutput(io.Writer)
 
@@ -145,6 +148,9 @@ type Logger interface {
 	// source adds file, line and function fields to the event
 	source() *logrus.Entry
 
+	// Entry returns the logrus raw entry
+	Entry() *logrus.Entry
+
 	// Adds a hook to the logger
 	AddHook(hook logrus.Hook)
 
@@ -155,7 +161,6 @@ type Logger interface {
 	Metrics(category telemetryspec.Category, metrics telemetryspec.MetricDetails, details interface{})
 	Event(category telemetryspec.Category, identifier telemetryspec.Event)
 	EventWithDetails(category telemetryspec.Category, identifier telemetryspec.Event, details interface{})
-	StartOperation(category telemetryspec.Category, identifier telemetryspec.Operation) TelemetryOperation
 	GetTelemetrySession() string
 	GetTelemetryGUID() string
 	GetInstanceName() string
@@ -285,6 +290,10 @@ func (l logger) WithFields(fields Fields) Logger {
 	}
 }
 
+func (l logger) GetLevel() (lvl Level) {
+	return Level(l.entry.Logger.Level)
+}
+
 func (l logger) SetLevel(lvl Level) {
 	l.entry.Logger.Level = logrus.Level(lvl)
 }
@@ -302,7 +311,7 @@ func (l logger) SetOutput(w io.Writer) {
 }
 
 func (l logger) setOutput(w io.Writer) {
-	l.entry.Logger.Out = w
+	l.entry.Logger.SetOutput(w)
 }
 
 func (l logger) getOutput() io.Writer {
@@ -310,7 +319,11 @@ func (l logger) getOutput() io.Writer {
 }
 
 func (l logger) SetJSONFormatter() {
-	l.entry.Logger.Formatter = &logrus.JSONFormatter{TimestampFormat: "2006-01-02T15:04:05.000000Z07:00"}
+	l.entry.Logger.SetFormatter(&logrus.JSONFormatter{TimestampFormat: "2006-01-02T15:04:05.000000Z07:00"})
+}
+
+func (l logger) Entry() *logrus.Entry {
+	return l.entry
 }
 
 func (l logger) source() *logrus.Entry {
@@ -368,6 +381,12 @@ func NewWrappedLogger(l *logrus.Logger) Logger {
 		tf.TimestampFormat = "2006-01-02T15:04:05.000000 -0700"
 	}
 	return out
+}
+
+// RegisterExitHandler registers a function to be called on exit by logrus
+// Exit handling happens when logrus.Exit is called, which is called by logrus.Fatal
+func RegisterExitHandler(handler func()) {
+	logrus.RegisterExitHandler(handler)
 }
 
 func (l logger) EnableTelemetry(cfg TelemetryConfig) (err error) {
@@ -449,13 +468,6 @@ func (l logger) EventWithDetails(category telemetryspec.Category, identifier tel
 	if l.loggerState.telemetry != nil {
 		l.loggerState.telemetry.logEvent(l, category, identifier, details)
 	}
-}
-
-func (l logger) StartOperation(category telemetryspec.Category, identifier telemetryspec.Operation) TelemetryOperation {
-	if l.loggerState.telemetry != nil {
-		return l.loggerState.telemetry.logStartOperation(l, category, identifier)
-	}
-	return TelemetryOperation{}
 }
 
 func (l logger) CloseTelemetry() {

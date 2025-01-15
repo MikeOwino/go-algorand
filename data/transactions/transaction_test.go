@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2022 Algorand, Inc.
+// Copyright (C) 2019-2025 Algorand, Inc.
 // This file is part of go-algorand
 //
 // go-algorand is free software: you can redistribute it and/or modify
@@ -22,6 +22,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/algorand/go-algorand/config"
@@ -29,6 +30,7 @@ import (
 	"github.com/algorand/go-algorand/crypto/merklesignature"
 	"github.com/algorand/go-algorand/crypto/stateproof"
 	"github.com/algorand/go-algorand/data/basics"
+	"github.com/algorand/go-algorand/data/committee"
 	"github.com/algorand/go-algorand/data/stateproofmsg"
 	"github.com/algorand/go-algorand/protocol"
 	"github.com/algorand/go-algorand/test/partitiontest"
@@ -101,13 +103,15 @@ func TestGoOnlineGoNonparticipatingContradiction(t *testing.T) {
 	tx.KeyregTxnFields = KeyregTxnFields{
 		VotePK:           v.OneTimeSignatureVerifier,
 		SelectionPK:      vrf.PK,
+		VoteKeyDilution:  1,
+		VoteFirst:        1,
+		VoteLast:         100,
 		Nonparticipation: true,
 	}
 	// this tx tries to both register keys to go online, and mark an account as non-participating.
 	// it is not well-formed.
-	feeSink := basics.Address{0x7, 0xda, 0xcb, 0x4b, 0x6d, 0x9e, 0xd1, 0x41, 0xb1, 0x75, 0x76, 0xbd, 0x45, 0x9a, 0xe6, 0x42, 0x1d, 0x48, 0x6d, 0xa3, 0xd4, 0xef, 0x22, 0x47, 0xc4, 0x9, 0xa3, 0x96, 0xb8, 0x2e, 0xa2, 0x21}
-	err = tx.WellFormed(SpecialAddresses{FeeSink: feeSink}, config.Consensus[protocol.ConsensusCurrentVersion])
-	require.Error(t, err)
+	err = tx.WellFormed(SpecialAddresses{}, config.Consensus[protocol.ConsensusCurrentVersion])
+	require.ErrorContains(t, err, "tries to register keys to go online, but nonparticipatory flag is set")
 }
 
 func TestGoNonparticipatingWellFormed(t *testing.T) {
@@ -125,19 +129,17 @@ func TestGoNonparticipatingWellFormed(t *testing.T) {
 	}
 
 	// this tx is well-formed
-	feeSink := basics.Address{0x7, 0xda, 0xcb, 0x4b, 0x6d, 0x9e, 0xd1, 0x41, 0xb1, 0x75, 0x76, 0xbd, 0x45, 0x9a, 0xe6, 0x42, 0x1d, 0x48, 0x6d, 0xa3, 0xd4, 0xef, 0x22, 0x47, 0xc4, 0x9, 0xa3, 0x96, 0xb8, 0x2e, 0xa2, 0x21}
-	err = tx.WellFormed(SpecialAddresses{FeeSink: feeSink}, curProto)
+	err = tx.WellFormed(SpecialAddresses{}, curProto)
 	require.NoError(t, err)
 	// but it should stop being well-formed if the protocol does not support it
 	curProto.SupportBecomeNonParticipatingTransactions = false
-	err = tx.WellFormed(SpecialAddresses{FeeSink: feeSink}, curProto)
-	require.Error(t, err)
+	err = tx.WellFormed(SpecialAddresses{}, curProto)
+	require.ErrorContains(t, err, "mark an account as nonparticipating, but")
 }
 
 func TestAppCallCreateWellFormed(t *testing.T) {
 	partitiontest.PartitionTest(t)
 
-	feeSink := basics.Address{0x7, 0xda, 0xcb, 0x4b, 0x6d, 0x9e, 0xd1, 0x41, 0xb1, 0x75, 0x76, 0xbd, 0x45, 0x9a, 0xe6, 0x42, 0x1d, 0x48, 0x6d, 0xa3, 0xd4, 0xef, 0x22, 0x47, 0xc4, 0x9, 0xa3, 0x96, 0xb8, 0x2e, 0xa2, 0x21}
 	curProto := config.Consensus[protocol.ConsensusCurrentVersion]
 	futureProto := config.Consensus[protocol.ConsensusFuture]
 	addr1, err := basics.UnmarshalChecksumAddress("NDQCJNNY5WWWFLP4GFZ7MEF2QJSMZYK6OWIV2AQ7OMAVLEFCGGRHFPKJJA")
@@ -253,7 +255,7 @@ func TestAppCallCreateWellFormed(t *testing.T) {
 	}
 	for i, usecase := range usecases {
 		t.Run(fmt.Sprintf("i=%d", i), func(t *testing.T) {
-			err := usecase.tx.WellFormed(SpecialAddresses{FeeSink: feeSink}, usecase.proto)
+			err := usecase.tx.WellFormed(SpecialAddresses{}, usecase.proto)
 			if usecase.expectedError != "" {
 				require.Error(t, err)
 				require.Contains(t, err.Error(), usecase.expectedError)
@@ -267,13 +269,12 @@ func TestAppCallCreateWellFormed(t *testing.T) {
 func TestWellFormedErrors(t *testing.T) {
 	partitiontest.PartitionTest(t)
 
-	feeSink := basics.Address{0x7, 0xda, 0xcb, 0x4b, 0x6d, 0x9e, 0xd1, 0x41, 0xb1, 0x75, 0x76, 0xbd, 0x45, 0x9a, 0xe6, 0x42, 0x1d, 0x48, 0x6d, 0xa3, 0xd4, 0xef, 0x22, 0x47, 0xc4, 0x9, 0xa3, 0x96, 0xb8, 0x2e, 0xa2, 0x21}
-	specialAddr := SpecialAddresses{FeeSink: feeSink}
 	curProto := config.Consensus[protocol.ConsensusCurrentVersion]
 	futureProto := config.Consensus[protocol.ConsensusFuture]
 	protoV27 := config.Consensus[protocol.ConsensusV27]
 	protoV28 := config.Consensus[protocol.ConsensusV28]
 	protoV32 := config.Consensus[protocol.ConsensusV32]
+	protoV36 := config.Consensus[protocol.ConsensusV36]
 	addr1, err := basics.UnmarshalChecksumAddress("NDQCJNNY5WWWFLP4GFZ7MEF2QJSMZYK6OWIV2AQ7OMAVLEFCGGRHFPKJJA")
 	require.NoError(t, err)
 	v5 := []byte{0x05}
@@ -566,10 +567,182 @@ func TestWellFormedErrors(t *testing.T) {
 			proto:         protoV32,
 			expectedError: fmt.Errorf("tx.Boxes too long, max number of box references is 0"),
 		},
+		{
+			tx: Transaction{
+				Type:   protocol.ApplicationCallTx,
+				Header: okHeader,
+				ApplicationCallTxnFields: ApplicationCallTxnFields{
+					ApplicationID: 1,
+					Boxes:         []BoxRef{{Index: 1, Name: make([]byte, 65)}},
+					ForeignApps:   []basics.AppIndex{1},
+				},
+			},
+			proto:         futureProto,
+			expectedError: fmt.Errorf("tx.Boxes[0].Name too long, max len 64 bytes"),
+		},
+		{
+			tx: Transaction{
+				Type:   protocol.ApplicationCallTx,
+				Header: okHeader,
+				ApplicationCallTxnFields: ApplicationCallTxnFields{
+					ApplicationID: 1,
+					Boxes:         []BoxRef{{Index: 1, Name: make([]byte, 65)}},
+					ForeignApps:   []basics.AppIndex{1},
+				},
+			},
+			proto:         protoV36,
+			expectedError: nil,
+		},
+		{
+			tx: Transaction{
+				Type:   protocol.HeartbeatTx,
+				Header: okHeader,
+			},
+			proto:         protoV36,
+			expectedError: fmt.Errorf("heartbeat transaction not supported"),
+		},
+		{
+			tx: Transaction{
+				Type:   protocol.HeartbeatTx,
+				Header: okHeader,
+				HeartbeatTxnFields: &HeartbeatTxnFields{
+					HbSeed:        committee.Seed{0x02},
+					HbVoteID:      crypto.OneTimeSignatureVerifier{0x03},
+					HbKeyDilution: 10,
+				},
+			},
+			proto:         futureProto,
+			expectedError: fmt.Errorf("tx.HbProof is empty"),
+		},
+		{
+			tx: Transaction{
+				Type:   protocol.HeartbeatTx,
+				Header: okHeader,
+				HeartbeatTxnFields: &HeartbeatTxnFields{
+					HbProof: crypto.HeartbeatProof{
+						Sig: [64]byte{0x01},
+					},
+					HbVoteID:      crypto.OneTimeSignatureVerifier{0x03},
+					HbKeyDilution: 10,
+				},
+			},
+			proto:         futureProto,
+			expectedError: fmt.Errorf("tx.HbSeed is empty"),
+		},
+		{
+			tx: Transaction{
+				Type:   protocol.HeartbeatTx,
+				Header: okHeader,
+				HeartbeatTxnFields: &HeartbeatTxnFields{
+					HbProof: crypto.HeartbeatProof{
+						Sig: [64]byte{0x01},
+					},
+					HbSeed:        committee.Seed{0x02},
+					HbKeyDilution: 10,
+				},
+			},
+			proto:         futureProto,
+			expectedError: fmt.Errorf("tx.HbVoteID is empty"),
+		},
+		{
+			tx: Transaction{
+				Type:   protocol.HeartbeatTx,
+				Header: okHeader,
+				HeartbeatTxnFields: &HeartbeatTxnFields{
+					HbProof: crypto.HeartbeatProof{
+						Sig: [64]byte{0x01},
+					},
+					HbSeed:   committee.Seed{0x02},
+					HbVoteID: crypto.OneTimeSignatureVerifier{0x03},
+				},
+			},
+			proto:         futureProto,
+			expectedError: fmt.Errorf("tx.HbKeyDilution is zero"),
+		},
+		{
+			tx: Transaction{
+				Type:   protocol.HeartbeatTx,
+				Header: okHeader,
+				HeartbeatTxnFields: &HeartbeatTxnFields{
+					HbProof: crypto.HeartbeatProof{
+						Sig: [64]byte{0x01},
+					},
+					HbSeed:        committee.Seed{0x02},
+					HbVoteID:      crypto.OneTimeSignatureVerifier{0x03},
+					HbKeyDilution: 10,
+				},
+			},
+			proto: futureProto,
+		},
+		{
+			tx: Transaction{
+				Type: protocol.HeartbeatTx,
+				Header: Header{
+					Sender:     addr1,
+					Fee:        basics.MicroAlgos{Raw: 100},
+					LastValid:  105,
+					FirstValid: 100,
+					Note:       []byte{0x01},
+				},
+				HeartbeatTxnFields: &HeartbeatTxnFields{
+					HbProof: crypto.HeartbeatProof{
+						Sig: [64]byte{0x01},
+					},
+					HbSeed:        committee.Seed{0x02},
+					HbVoteID:      crypto.OneTimeSignatureVerifier{0x03},
+					HbKeyDilution: 10,
+				},
+			},
+			proto:         futureProto,
+			expectedError: fmt.Errorf("tx.Note is set in cheap heartbeat"),
+		},
+		{
+			tx: Transaction{
+				Type: protocol.HeartbeatTx,
+				Header: Header{
+					Sender:     addr1,
+					Fee:        basics.MicroAlgos{Raw: 100},
+					LastValid:  105,
+					FirstValid: 100,
+					Lease:      [32]byte{0x01},
+				},
+				HeartbeatTxnFields: &HeartbeatTxnFields{
+					HbProof: crypto.HeartbeatProof{
+						Sig: [64]byte{0x01},
+					},
+					HbSeed:        committee.Seed{0x02},
+					HbVoteID:      crypto.OneTimeSignatureVerifier{0x03},
+					HbKeyDilution: 10,
+				},
+			},
+			proto:         futureProto,
+			expectedError: fmt.Errorf("tx.Lease is set in cheap heartbeat"),
+		},
+		{
+			tx: Transaction{
+				Type: protocol.HeartbeatTx,
+				Header: Header{
+					Sender:     addr1,
+					LastValid:  105,
+					FirstValid: 100,
+					RekeyTo:    [32]byte{0x01},
+				},
+				HeartbeatTxnFields: &HeartbeatTxnFields{
+					HbProof: crypto.HeartbeatProof{
+						Sig: [64]byte{0x01},
+					},
+					HbSeed:        committee.Seed{0x02},
+					HbVoteID:      crypto.OneTimeSignatureVerifier{0x03},
+					HbKeyDilution: 10,
+				},
+			},
+			proto:         futureProto,
+			expectedError: fmt.Errorf("tx.RekeyTo is set in free heartbeat"),
+		},
 	}
 	for _, usecase := range usecases {
-		err := usecase.tx.WellFormed(specialAddr, usecase.proto)
-		require.Equal(t, usecase.expectedError, err)
+		err := usecase.tx.WellFormed(SpecialAddresses{}, usecase.proto)
+		assert.Equal(t, usecase.expectedError, err)
 	}
 }
 
@@ -605,14 +778,12 @@ func TestWellFormedKeyRegistrationTx(t *testing.T) {
 
 	tx := generateDummyGoNonparticpatingTransaction(addr)
 	curProto := config.Consensus[protocol.ConsensusCurrentVersion]
-	feeSink := basics.Address{0x7, 0xda, 0xcb, 0x4b, 0x6d, 0x9e, 0xd1, 0x41, 0xb1, 0x75, 0x76, 0xbd, 0x45, 0x9a, 0xe6, 0x42, 0x1d, 0x48, 0x6d, 0xa3, 0xd4, 0xef, 0x22, 0x47, 0xc4, 0x9, 0xa3, 0x96, 0xb8, 0x2e, 0xa2, 0x21}
-	spec := SpecialAddresses{FeeSink: feeSink}
 	if !curProto.SupportBecomeNonParticipatingTransactions {
 		t.Skipf("Skipping rest of test because current protocol version %v does not support become-nonparticipating transactions", protocol.ConsensusCurrentVersion)
 	}
 
 	// this tx is well-formed
-	err = tx.WellFormed(spec, curProto)
+	err = tx.WellFormed(SpecialAddresses{}, curProto)
 	require.NoError(t, err)
 
 	type keyRegTestCase struct {
@@ -650,7 +821,7 @@ func TestWellFormedKeyRegistrationTx(t *testing.T) {
 		curProto.EnableKeyregCoherencyCheck = testCase.enableKeyregCoherencyCheck
 		curProto.EnableStateProofKeyregCheck = testCase.enableStateProofKeyregCheck
 		curProto.MaxKeyregValidPeriod = maxValidPeriod // TODO: remove this when MaxKeyregValidPeriod is in CurrentVersion
-		return tx.WellFormed(spec, curProto)
+		return tx.WellFormed(SpecialAddresses{}, curProto)
 	}
 
 	if *generateFlag == true {

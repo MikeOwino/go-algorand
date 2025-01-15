@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2022 Algorand, Inc.
+// Copyright (C) 2019-2025 Algorand, Inc.
 // This file is part of go-algorand
 //
 // go-algorand is free software: you can redistribute it and/or modify
@@ -14,13 +14,19 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with go-algorand.  If not, see <https://www.gnu.org/licenses/>.
 
+// Package pingpong provides a transaction generating utility for performance testing.
+//
+//nolint:unused,structcheck,deadcode,varcheck // ignore unused pingpong code
 package pingpong
 
 import (
+	"bufio"
+	"compress/gzip"
 	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"math/rand"
 	"os"
@@ -34,6 +40,7 @@ import (
 	"github.com/algorand/go-algorand/crypto"
 	"github.com/algorand/go-algorand/daemon/algod/api/server/v2/generated/model"
 	"github.com/algorand/go-algorand/data/basics"
+	"github.com/algorand/go-algorand/data/bookkeeping"
 	"github.com/algorand/go-algorand/data/transactions"
 	"github.com/algorand/go-algorand/data/transactions/logic"
 	"github.com/algorand/go-algorand/libgoal"
@@ -50,7 +57,7 @@ type CreatablesInfo struct {
 // pingPongAccount represents the account state for each account in the pingpong application
 // This includes the current balance and public/private keys tied to the account
 type pingPongAccount struct {
-	balance      uint64
+	balance      atomic.Uint64
 	balanceRound uint64
 
 	deadlock.Mutex
@@ -62,22 +69,22 @@ type pingPongAccount struct {
 }
 
 func (ppa *pingPongAccount) getBalance() uint64 {
-	return atomic.LoadUint64(&ppa.balance)
+	return ppa.balance.Load()
 }
 
 func (ppa *pingPongAccount) setBalance(balance uint64) {
-	atomic.StoreUint64(&ppa.balance, balance)
+	ppa.balance.Store(balance)
 }
 
 func (ppa *pingPongAccount) addBalance(offset int64) {
 	if offset >= 0 {
-		atomic.AddUint64(&ppa.balance, uint64(offset))
+		ppa.balance.Add(uint64(offset))
 		return
 	}
 	for {
-		v := atomic.LoadUint64(&ppa.balance)
+		v := ppa.balance.Load()
 		nv := v - uint64(-offset)
-		done := atomic.CompareAndSwapUint64(&ppa.balance, v, nv)
+		done := ppa.balance.CompareAndSwap(v, nv)
 		if done {
 			return
 		}
@@ -111,7 +118,7 @@ func (ppa *pingPongAccount) String() string {
 	ppa.Lock()
 	defer ppa.Unlock()
 	var ow strings.Builder
-	fmt.Fprintf(&ow, "%s %d", ppa.pk.String(), ppa.balance)
+	fmt.Fprintf(&ow, "%s %d", ppa.pk.String(), ppa.balance.Load())
 	if len(ppa.holdings) > 0 {
 		fmt.Fprintf(&ow, "[")
 		first := true
@@ -126,6 +133,11 @@ func (ppa *pingPongAccount) String() string {
 		fmt.Fprintf(&ow, "]")
 	}
 	return ow.String()
+}
+
+type txidSendTime struct {
+	txid string
+	when time.Time
 }
 
 // WorkerState object holds a running pingpong worker
@@ -149,6 +161,11 @@ type WorkerState struct {
 	refreshPos   int
 
 	client *libgoal.Client
+
+	// TotalLatencyOut stuff
+	sentTxid      chan txidSendTime
+	latencyBlocks chan bookkeeping.Block
+	latencyOuts   []io.Writer // latencyOuts is a chain of *os.File, gzip, etc. Write to last element. .Close() last to first.
 }
 
 // returns the number of boxes per app
@@ -278,17 +295,19 @@ func (pps *WorkerState) scheduleAction() bool {
 		}
 		pps.refreshPos = 0
 	}
-	addr := pps.refreshAddrs[pps.refreshPos]
-	ai, err := pps.client.AccountInformation(addr, true)
-	if err == nil {
-		ppa := pps.accounts[addr]
+	if pps.cfg.NumApp > 0 || pps.cfg.NumAsset > 0 {
+		addr := pps.refreshAddrs[pps.refreshPos]
+		ai, err := pps.client.AccountInformation(addr, true)
+		if err == nil {
+			ppa := pps.accounts[addr]
 
-		pps.integrateAccountInfo(addr, ppa, ai)
-	} else {
-		if !pps.cfg.Quiet {
-			fmt.Printf("background refresh err: %v\n", err)
+			pps.integrateAccountInfo(addr, ppa, ai)
+		} else {
+			if !pps.cfg.Quiet {
+				fmt.Printf("background refresh err: %v\n", err)
+			}
+			return false
 		}
-		return false
 	}
 	pps.refreshPos++
 	return true
@@ -343,6 +362,25 @@ func (pps *WorkerState) schedule(n int) {
 	}
 	pps.nextSendTime = nextSendTime
 	//fmt.Printf("schedule now=%s next=%s\n", now, pps.nextSendTime)
+}
+
+func (pps *WorkerState) recordTxidSent(txid string, err error) {
+	if err != nil {
+		return
+	}
+	if pps.sentTxid == nil {
+		return
+	}
+	rec := txidSendTime{
+		txid: txid,
+		when: time.Now(),
+	}
+	select {
+	case pps.sentTxid <- rec:
+		// ok!
+	default:
+		// drop, oh well
+	}
 }
 
 func (pps *WorkerState) fundAccounts(client *libgoal.Client) error {
@@ -545,6 +583,9 @@ func (pps *WorkerState) RunPingPong(ctx context.Context, ac *libgoal.Client) {
 	//			error = fundAccounts()
 	//  }
 
+	if pps.cfg.TotalLatencyOut != "" {
+		pps.startTxLatency(ctx, ac)
+	}
 	pps.nextSendTime = time.Now()
 	ac.SetSuggestedParamsCacheAge(200 * time.Millisecond)
 	pps.client = ac
@@ -773,7 +814,16 @@ func (pps *WorkerState) sendFromTo(
 
 			sentCount++
 			pps.schedule(1)
-			_, sendErr = client.BroadcastTransaction(stxn)
+			var txid string
+			if pps.cfg.AsyncSending {
+				sendErr = client.BroadcastTransactionAsync(stxn)
+				if sendErr == nil {
+					txid = stxn.Txn.ID().String()
+				}
+			} else {
+				txid, sendErr = client.BroadcastTransaction(stxn)
+			}
+			pps.recordTxidSent(txid, sendErr)
 		} else {
 			// Generate txn group
 
@@ -844,6 +894,8 @@ func (pps *WorkerState) sendFromTo(
 			sentCount += uint64(len(txGroup))
 			pps.schedule(len(txGroup))
 			sendErr = client.BroadcastTransactionGroup(stxGroup)
+			txid := txGroup[0].ID().String()
+			pps.recordTxidSent(txid, sendErr)
 		}
 
 		if sendErr != nil {
@@ -984,11 +1036,11 @@ type paymentUpdate struct {
 }
 
 func (au *paymentUpdate) apply(pps *WorkerState) {
-	pps.accounts[au.from].balance -= (au.fee + au.amt)
+	pps.accounts[au.from].balance.Add(-(au.fee + au.amt))
 	// update account balance
 	to := pps.accounts[au.to]
 	if to != nil {
-		to.balance += au.amt
+		to.balance.Add(au.amt)
 	}
 }
 
@@ -1112,7 +1164,7 @@ type assetUpdate struct {
 }
 
 func (au *assetUpdate) apply(pps *WorkerState) {
-	pps.accounts[au.from].balance -= au.fee
+	pps.accounts[au.from].balance.Add(-au.fee)
 	pps.accounts[au.from].holdings[au.aidx] -= au.amt
 	to := pps.accounts[au.to]
 	if to.holdings == nil {
@@ -1188,7 +1240,7 @@ type appUpdate struct {
 }
 
 func (au *appUpdate) apply(pps *WorkerState) {
-	pps.accounts[au.from].balance -= au.fee
+	pps.accounts[au.from].balance.Add(-au.fee)
 }
 
 func (pps *WorkerState) constructNFTGenTxn(from, to string, fee uint64, client *libgoal.Client, noteField []byte, lease [32]byte) (txn transactions.Transaction, sender string, update txnUpdate, err error) {
@@ -1271,7 +1323,7 @@ type nftgenUpdate struct {
 }
 
 func (au *nftgenUpdate) apply(pps *WorkerState) {
-	pps.accounts[au.from].balance -= au.fee
+	pps.accounts[au.from].balance.Add(-au.fee)
 }
 
 func signTxn(signer *pingPongAccount, txn transactions.Transaction, cfg PpConfig) (stxn transactions.SignedTxn, err error) {
@@ -1297,4 +1349,153 @@ func signTxn(signer *pingPongAccount, txn transactions.Transaction, cfg PpConfig
 		stxn, err = txn.Sign(signer.sk), nil
 	}
 	return
+}
+
+func (pps *WorkerState) startTxLatency(ctx context.Context, ac *libgoal.Client) {
+	fout, err := os.Create(pps.cfg.TotalLatencyOut)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%s: %v", pps.cfg.TotalLatencyOut, err)
+		return
+	}
+	pps.latencyOuts = append(pps.latencyOuts, fout)
+	if strings.HasSuffix(pps.cfg.TotalLatencyOut, ".gz") {
+		gzout := gzip.NewWriter(fout)
+		pps.latencyOuts = append(pps.latencyOuts, gzout)
+	} else {
+		bw := bufio.NewWriter(fout)
+		pps.latencyOuts = append(pps.latencyOuts, bw)
+	}
+	pps.sentTxid = make(chan txidSendTime, 1000)
+	pps.latencyBlocks = make(chan bookkeeping.Block, 1)
+	go pps.txidLatency(ctx)
+	go pps.txidLatencyBlockWaiter(ctx, ac)
+}
+
+type txidSendTimeIndexed struct {
+	txidSendTime
+	index int
+}
+
+const txidLatencySampleSize = 10000
+
+// thread which handles measuring total send-to-commit latency
+func (pps *WorkerState) txidLatency(ctx context.Context) {
+	byTxid := make(map[string]txidSendTimeIndexed, txidLatencySampleSize)
+	txidList := make([]string, 0, txidLatencySampleSize)
+	out := pps.latencyOuts[len(pps.latencyOuts)-1]
+	for {
+		select {
+		case st := <-pps.sentTxid:
+			if len(txidList) < txidLatencySampleSize {
+				index := len(txidList)
+				txidList = append(txidList, st.txid)
+				byTxid[st.txid] = txidSendTimeIndexed{
+					st,
+					index,
+				}
+			} else {
+				// random replacement
+				evict := rand.Intn(len(txidList))
+				delete(byTxid, txidList[evict])
+				txidList[evict] = st.txid
+				byTxid[st.txid] = txidSendTimeIndexed{
+					st,
+					evict,
+				}
+			}
+		case bl := <-pps.latencyBlocks:
+			now := time.Now()
+			txns, err := bl.DecodePaysetFlat()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "block[%d] payset err %v", bl.Round(), err)
+				return
+			}
+			for _, stxn := range txns {
+				txid := stxn.ID().String()
+				st, ok := byTxid[txid]
+				if ok {
+					dt := now.Sub(st.when)
+					fmt.Fprintf(out, "%d\n", dt.Nanoseconds())
+				}
+			}
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+type flusher interface {
+	Flush() error
+}
+
+func (pps *WorkerState) txidLatencyDone() {
+	for i := len(pps.latencyOuts); i >= 0; i-- {
+		xo := pps.latencyOuts[i]
+		if fl, ok := xo.(flusher); ok {
+			err := fl.Flush()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "%s: %v", pps.cfg.TotalLatencyOut, err)
+			}
+		}
+		if cl, ok := xo.(io.Closer); ok {
+			err := cl.Close()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "%s: %v", pps.cfg.TotalLatencyOut, err)
+			}
+		}
+	}
+}
+
+const errRestartTime = time.Second
+
+func (pps *WorkerState) txidLatencyBlockWaiter(ctx context.Context, ac *libgoal.Client) {
+	defer close(pps.latencyBlocks)
+	done := ctx.Done()
+	isDone := func(err error) bool {
+		select {
+		case <-done:
+			return true
+		default:
+		}
+		fmt.Fprintf(os.Stderr, "block waiter st : %v", err)
+		time.Sleep(errRestartTime)
+		return false
+	}
+restart:
+	select {
+	case <-done:
+		return
+	default:
+	}
+	st, err := ac.Status()
+	if err != nil {
+		if isDone(err) {
+			return
+		}
+		goto restart
+	}
+	nextRound := st.LastRound
+	for {
+		select {
+		case <-done:
+			return
+		default:
+		}
+		st, err = ac.WaitForRound(nextRound)
+		if err != nil {
+			if isDone(err) {
+				return
+			}
+			goto restart
+		}
+		bb, err := ac.BookkeepingBlock(st.LastRound)
+		if err != nil {
+			if isDone(err) {
+				return
+			}
+			goto restart
+		}
+		pps.latencyBlocks <- bb
+		nextRound = st.LastRound
+	}
 }

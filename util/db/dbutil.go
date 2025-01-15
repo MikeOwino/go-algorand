@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2022 Algorand, Inc.
+// Copyright (C) 2019-2025 Algorand, Inc.
 // This file is part of go-algorand
 //
 // go-algorand is free software: you can redistribute it and/or modify
@@ -219,6 +219,14 @@ func (db *Accessor) Atomic(fn idemFn, extras ...interface{}) (err error) {
 // For transactions where readOnly is false, sync determines whether or not to wait for the result.
 // Like for Atomic, the return error of fn should be a native sqlite3.Error type or an error wrapping it.
 func (db *Accessor) AtomicContext(ctx context.Context, fn idemFn, extras ...interface{}) (err error) {
+
+	return db.AtomicContextWithRetryClearFn(ctx, fn, nil, extras...)
+}
+
+// AtomicContextWithRetryClearFn is like AtomicContext, but calls retryClearFn if the database
+// txn was rolled back, due to error or in between retries. This helps a caller that
+// might change in-memory state inside fn.
+func (db *Accessor) AtomicContextWithRetryClearFn(ctx context.Context, fn idemFn, retryClearFn func(context.Context), extras ...interface{}) (err error) {
 	atomicDeadline := time.Now().Add(time.Second)
 
 	// note that the sql library will drop panics inside an active transaction
@@ -294,9 +302,12 @@ func (db *Accessor) AtomicContext(ctx context.Context, fn idemFn, extras ...inte
 		if err != nil {
 			tx.Rollback()
 			if dbretry(err) {
-				continue
+				if retryClearFn != nil {
+					retryClearFn(ctx)
+				}
+				continue // retry
 			} else {
-				break
+				break // exit, returns error
 			}
 		}
 
@@ -305,13 +316,18 @@ func (db *Accessor) AtomicContext(ctx context.Context, fn idemFn, extras ...inte
 			// update the deadline, as it might have been updated.
 			atomicDeadline = txContextData.deadline
 			break
-		} else if !dbretry(err) {
-			break
+		} else if dbretry(err) {
+			if retryClearFn != nil {
+				retryClearFn(ctx)
+			}
+			continue // retry
+		} else {
+			break // exit, returns error
 		}
 	}
 
 	if time.Now().After(atomicDeadline) {
-		db.getDecoratedLogger(fn, extras).Warnf("dbatomic: tx surpassed expected deadline by %v", time.Now().Sub(atomicDeadline))
+		db.getDecoratedLogger(fn, extras).Warnf("dbatomic: tx surpassed expected deadline by %v", time.Since(atomicDeadline))
 	}
 	return
 }
@@ -321,7 +337,7 @@ func (db *Accessor) AtomicContext(ctx context.Context, fn idemFn, extras ...inte
 // however, the transaction context and transaction object can be used to uniquely associate the request
 // with a particular deadline.
 // the function fails if the given transaction is not on the stack of the provided context.
-func ResetTransactionWarnDeadline(ctx context.Context, tx *sql.Tx, deadline time.Time) (prevDeadline time.Time, err error) {
+func ResetTransactionWarnDeadline(ctx context.Context, tx interface{}, deadline time.Time) (prevDeadline time.Time, err error) {
 	txContextData, ok := ctx.Value(tx).(*txExecutionContext)
 	if !ok {
 		// it's not a valid call. just return an error.

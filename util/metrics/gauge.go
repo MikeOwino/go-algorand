@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2022 Algorand, Inc.
+// Copyright (C) 2019-2025 Algorand, Inc.
 // This file is part of go-algorand
 //
 // go-algorand is free software: you can redistribute it and/or modify
@@ -17,27 +17,31 @@
 package metrics
 
 import (
-	"strconv"
 	"strings"
-
-	"github.com/algorand/go-deadlock"
 )
 
 // Gauge represent a single gauge variable.
 type Gauge struct {
-	deadlock.Mutex
-	name        string
-	description string
-	value       float64
+	g couge
 }
 
 // MakeGauge create a new gauge with the provided name and description.
 func MakeGauge(metric MetricName) *Gauge {
-	c := &Gauge{
-		description: metric.Description,
-		name:        metric.Name,
-	}
+	c := makeGauge(metric)
 	c.Register(nil)
+	return c
+}
+
+// makeGauge create a new gauge with the provided name and description
+// but does not register it with the default registry.
+func makeGauge(metric MetricName) *Gauge {
+	c := &Gauge{g: couge{
+		values:        make([]*cougeValues, 0),
+		description:   metric.Description,
+		name:          metric.Name,
+		labels:        make(map[string]int),
+		valuesIndices: make(map[int]int),
+	}}
 	return c
 }
 
@@ -59,46 +63,32 @@ func (gauge *Gauge) Deregister(reg *Registry) {
 	}
 }
 
-// Add increases gauge by x
-func (gauge *Gauge) Add(x float64) {
-	gauge.Lock()
-	defer gauge.Unlock()
-	gauge.value += x
+// Set sets gauge to x
+func (gauge *Gauge) Set(x uint64) {
+	if gauge.g.intValue.Swap(x) == 0 {
+		// This is the first Set. Create a dummy
+		// counterValue for the no-labels value.
+		// Dummy counterValue simplifies display in WriteMetric.
+		gauge.g.setLabels(0, nil)
+	}
 }
 
-// Set sets gauge to x
-func (gauge *Gauge) Set(x float64) {
-	gauge.Lock()
-	defer gauge.Unlock()
-	gauge.value = x
+// SetLabels sets gauge to x with labels
+func (gauge *Gauge) SetLabels(x uint64, labels map[string]string) {
+	gauge.g.setLabels(x, labels)
 }
 
 // WriteMetric writes the metric into the output stream
 func (gauge *Gauge) WriteMetric(buf *strings.Builder, parentLabels string) {
-	gauge.Lock()
-	defer gauge.Unlock()
-
-	buf.WriteString("# HELP ")
-	buf.WriteString(gauge.name)
-	buf.WriteString(" ")
-	buf.WriteString(gauge.description)
-	buf.WriteString("\n# TYPE ")
-	buf.WriteString(gauge.name)
-	buf.WriteString(" gauge\n")
-	buf.WriteString(gauge.name)
-	buf.WriteString("{")
-	if len(parentLabels) > 0 {
-		buf.WriteString(parentLabels)
-	}
-	buf.WriteString("} ")
-	buf.WriteString(strconv.FormatFloat(gauge.value, 'f', -1, 32))
-	buf.WriteString("\n")
+	gauge.g.writeMetric(buf, "gauge", parentLabels)
 }
 
 // AddMetric adds the metric into the map
 func (gauge *Gauge) AddMetric(values map[string]float64) {
-	gauge.Lock()
-	defer gauge.Unlock()
+	gauge.g.addMetric(values)
+}
 
-	values[sanitizeTelemetryName(gauge.name)] = gauge.value
+// GetUint64ValueForLabels returns the value of the counter for the given labels or 0 if it's not found.
+func (gauge *Gauge) GetUint64ValueForLabels(labels map[string]string) uint64 {
+	return gauge.g.getUint64ValueForLabels(labels)
 }

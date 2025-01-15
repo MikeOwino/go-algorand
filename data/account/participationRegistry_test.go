@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2022 Algorand, Inc.
+// Copyright (C) 2019-2025 Algorand, Inc.
 // This file is part of go-algorand
 //
 // go-algorand is free software: you can redistribute it and/or modify
@@ -23,7 +23,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -99,7 +98,7 @@ func makeTestParticipationWithLifetime(a *require.Assertions, addrID int, first,
 
 	// Generate part keys like in partGenerateCmd and FillDBWithParticipationKeys
 	if dilution == 0 {
-		dilution = 1 + uint64(math.Sqrt(float64(last-first)))
+		dilution = DefaultKeyDilution(first, last)
 	}
 
 	// Compute how many distinct participation keys we should generate
@@ -738,7 +737,7 @@ func TestParticipion_Blobs(t *testing.T) {
 	registry, dbfile := getRegistry(t)
 	defer registryCloseTest(t, registry, dbfile)
 
-	access, err := db.MakeAccessor("writetest_root", false, true)
+	access, err := db.MakeAccessor(t.Name()+"_writetest_root", false, true)
 	if err != nil {
 		panic(err)
 	}
@@ -746,7 +745,7 @@ func TestParticipion_Blobs(t *testing.T) {
 	access.Close()
 	a.NoError(err)
 
-	access, err = db.MakeAccessor("writetest", false, true)
+	access, err = db.MakeAccessor(t.Name()+"_writetest", false, true)
 	if err != nil {
 		panic(err)
 	}
@@ -781,7 +780,7 @@ func TestParticipion_EmptyBlobs(t *testing.T) {
 	registry, dbfile := getRegistry(t)
 	defer registryCloseTest(t, registry, dbfile)
 
-	access, err := db.MakeAccessor("writetest_root", false, true)
+	access, err := db.MakeAccessor(t.Name()+"_writetest_root", false, true)
 	if err != nil {
 		panic(err)
 	}
@@ -789,7 +788,7 @@ func TestParticipion_EmptyBlobs(t *testing.T) {
 	access.Close()
 	a.NoError(err)
 
-	access, err = db.MakeAccessor("writetest", false, true)
+	access, err = db.MakeAccessor(t.Name()+"_writetest", false, true)
 	if err != nil {
 		panic(err)
 	}
@@ -963,7 +962,7 @@ func TestGetRoundSecretsWithNilStateProofVerifier(t *testing.T) {
 	registry, dbfile := getRegistry(t)
 	defer registryCloseTest(t, registry, dbfile)
 
-	access, err := db.MakeAccessor("stateprooftest", false, true)
+	access, err := db.MakeAccessor(t.Name()+"_stateprooftest", false, true)
 	if err != nil {
 		panic(err)
 	}
@@ -1012,7 +1011,7 @@ func TestAddingSecretTwice(t *testing.T) {
 	registry, dbfile := getRegistry(t)
 	defer registryCloseTest(t, registry, dbfile)
 
-	access, err := db.MakeAccessor("stateprooftest", false, true)
+	access, err := db.MakeAccessor(t.Name()+"_stateprooftest", false, true)
 	if err != nil {
 		panic(err)
 	}
@@ -1050,7 +1049,7 @@ func TestGetRoundSecretsWithoutStateProof(t *testing.T) {
 	registry, dbfile := getRegistry(t)
 	defer registryCloseTest(t, registry, dbfile)
 
-	access, err := db.MakeAccessor("stateprooftest", false, true)
+	access, err := db.MakeAccessor(t.Name()+"_stateprooftest", false, true)
 	if err != nil {
 		panic(err)
 	}
@@ -1177,7 +1176,7 @@ func TestFlushResetsLastError(t *testing.T) {
 	registry, dbfile := getRegistry(t)
 	defer registryCloseTest(t, registry, dbfile)
 
-	access, err := db.MakeAccessor("stateprooftest", false, true)
+	access, err := db.MakeAccessor(t.Name()+"_stateprooftest", false, true)
 	a.NoError(err)
 
 	root, err := GenerateRoot(access)

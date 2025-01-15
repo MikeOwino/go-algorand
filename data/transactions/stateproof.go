@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2022 Algorand, Inc.
+// Copyright (C) 2019-2025 Algorand, Inc.
 // This file is part of go-algorand
 //
 // go-algorand is free software: you can redistribute it and/or modify
@@ -33,16 +33,9 @@ type StateProofTxnFields struct {
 	Message        stateproofmsg.Message   `codec:"spmsg"`
 }
 
-// Empty returns whether the StateProofTxnFields are all zero,
-// in the sense of being omitted in a msgpack encoding.
-func (sp StateProofTxnFields) Empty() bool {
-	return sp.StateProofType == protocol.StateProofBasic &&
-		sp.StateProof.MsgIsZero() &&
-		sp.Message.MsgIsZero()
-}
-
-//msgp:ignore specialAddr
 // specialAddr is used to form a unique address that will send out state proofs.
+//
+//msgp:ignore specialAddr
 type specialAddr string
 
 // ToBeHashed implements the crypto.Hashable interface

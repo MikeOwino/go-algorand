@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2022 Algorand, Inc.
+// Copyright (C) 2019-2025 Algorand, Inc.
 // This file is part of go-algorand
 //
 // go-algorand is free software: you can redistribute it and/or modify
@@ -21,10 +21,13 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"slices"
+	"sync"
 
 	"github.com/algorand/go-algorand/config"
 	"github.com/algorand/go-algorand/crypto"
 	"github.com/algorand/go-algorand/data/basics"
+	"github.com/algorand/go-algorand/data/committee"
 	"github.com/algorand/go-algorand/protocol"
 )
 
@@ -36,9 +39,9 @@ func (txid Txid) String() string {
 	return fmt.Sprintf("%v", crypto.Digest(txid))
 }
 
-// UnmarshalText initializes the Address from an array of bytes.
-func (txid *Txid) UnmarshalText(text []byte) error {
-	d, err := crypto.DigestFromString(string(text))
+// FromString initializes the Txid from a string
+func (txid *Txid) FromString(text string) error {
+	d, err := crypto.DigestFromString(text)
 	*txid = Txid(d)
 	return err
 }
@@ -58,7 +61,7 @@ type Header struct {
 	FirstValid  basics.Round      `codec:"fv"`
 	LastValid   basics.Round      `codec:"lv"`
 	Note        []byte            `codec:"note,allocbound=config.MaxTxnNoteBytes"` // Uniqueness or app-level data about txn
-	GenesisID   string            `codec:"gen"`
+	GenesisID   string            `codec:"gen,allocbound=config.MaxGenesisIDLen"`
 	GenesisHash crypto.Digest     `codec:"gh"`
 
 	// Group specifies that this transaction is part of a
@@ -98,6 +101,11 @@ type Transaction struct {
 	AssetFreezeTxnFields
 	ApplicationCallTxnFields
 	StateProofTxnFields
+
+	// By making HeartbeatTxnFields a pointer we save a ton of space of the
+	// Transaction object. Unlike other txn types, the fields will be
+	// embedded under a named field in the transaction encoding.
+	*HeartbeatTxnFields `codec:"hb"`
 }
 
 // ApplyData contains information about the transaction's execution.
@@ -118,7 +126,7 @@ type ApplyData struct {
 
 	// If asa or app is being created, the id used. Else 0.
 	// Names chosen to match naming the corresponding txn.
-	// These are populated on when MaxInnerTransactions > 0 (TEAL 5)
+	// These are populated only when MaxInnerTransactions > 0 (TEAL 5)
 	ConfigAsset   basics.AssetIndex `codec:"caid"`
 	ApplicationID basics.AppIndex   `codec:"apid"`
 }
@@ -176,30 +184,81 @@ func (tx Transaction) ToBeHashed() (protocol.HashID, []byte) {
 	return protocol.Transaction, protocol.Encode(&tx)
 }
 
+// txAllocSize returns the max possible size of a transaction without state proof fields.
+// It is used to preallocate a buffer for encoding a transaction.
+func txAllocSize() int {
+	return TransactionMaxSize() - StateProofTxnFieldsMaxSize()
+}
+
+// txEncodingPool holds temporary byte slice buffers used for encoding transaction messages.
+// Note, it prepends protocol.Transaction tag to the buffer economizing on subsequent append ops.
+var txEncodingPool = sync.Pool{
+	New: func() interface{} {
+		size := txAllocSize() + len(protocol.Transaction)
+		buf := make([]byte, len(protocol.Transaction), size)
+		copy(buf, []byte(protocol.Transaction))
+		return &txEncodingBuf{b: buf}
+	},
+}
+
+// getTxEncodingBuf returns a wrapped byte slice that can be used for encoding a
+// temporary message.  The byte slice length of encoded Transaction{} object.
+// The caller gets full ownership of the byte slice,
+// but is encouraged to return it using putEncodingBuf().
+func getTxEncodingBuf() *txEncodingBuf {
+	buf := txEncodingPool.Get().(*txEncodingBuf)
+	return buf
+}
+
+// putTxEncodingBuf places a byte slice into the pool of temporary buffers
+// for encoding.  The caller gives up ownership of the byte slice when
+// passing it to putTxEncodingBuf().
+func putTxEncodingBuf(buf *txEncodingBuf) {
+	buf.b = buf.b[:len(protocol.Transaction)]
+	txEncodingPool.Put(buf)
+}
+
+type txEncodingBuf struct {
+	b []byte
+}
+
 // ID returns the Txid (i.e., hash) of the transaction.
 func (tx Transaction) ID() Txid {
-	enc := tx.MarshalMsg(append(protocol.GetEncodingBuf(), []byte(protocol.Transaction)...))
-	defer protocol.PutEncodingBuf(enc)
+	buf := getTxEncodingBuf()
+	enc := tx.MarshalMsg(buf.b)
+	if cap(enc) > cap(buf.b) {
+		// use a bigger buffer as New's estimate was too small
+		buf.b = enc
+	}
+	defer putTxEncodingBuf(buf)
 	return Txid(crypto.Hash(enc))
 }
 
 // IDSha256 returns the digest (i.e., hash) of the transaction.
+// This is different from the canonical ID computed with Sum512_256 hashing function.
 func (tx Transaction) IDSha256() crypto.Digest {
-	enc := tx.MarshalMsg(append(protocol.GetEncodingBuf(), []byte(protocol.Transaction)...))
-	defer protocol.PutEncodingBuf(enc)
+	buf := getTxEncodingBuf()
+	enc := tx.MarshalMsg(buf.b)
+	if cap(enc) > cap(buf.b) {
+		buf.b = enc
+	}
+	defer putTxEncodingBuf(buf)
 	return sha256.Sum256(enc)
 }
 
 // InnerID returns something akin to Txid, but folds in the parent Txid and the
 // index of the inner call.
 func (tx Transaction) InnerID(parent Txid, index int) Txid {
-	input := append(protocol.GetEncodingBuf(), []byte(protocol.Transaction)...)
-	input = append(input, parent[:]...)
-	buf := make([]byte, 8)
-	binary.BigEndian.PutUint64(buf, uint64(index))
-	input = append(input, buf...)
+	buf := getTxEncodingBuf()
+	input := append(buf.b, parent[:]...)
+	var indexBuf [8]byte
+	binary.BigEndian.PutUint64(indexBuf[:], uint64(index))
+	input = append(input, indexBuf[:]...)
 	enc := tx.MarshalMsg(input)
-	defer protocol.PutEncodingBuf(enc)
+	if cap(enc) > cap(buf.b) {
+		buf.b = enc
+	}
+	defer putTxEncodingBuf(buf)
 	return Txid(crypto.Hash(enc))
 }
 
@@ -234,10 +293,11 @@ func (tx Header) Alive(tc TxnContext) error {
 	// Check round validity
 	round := tc.Round()
 	if round < tx.FirstValid || round > tx.LastValid {
-		return TxnDeadError{
+		return &TxnDeadError{
 			Round:      round,
 			FirstValid: tx.FirstValid,
 			LastValid:  tx.LastValid,
+			Early:      round < tx.FirstValid,
 		}
 	}
 
@@ -270,12 +330,7 @@ func (tx Header) Alive(tc TxnContext) error {
 
 // MatchAddress checks if the transaction touches a given address.
 func (tx Transaction) MatchAddress(addr basics.Address, spec SpecialAddresses) bool {
-	for _, candidate := range tx.RelevantAddrs(spec) {
-		if addr == candidate {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(tx.relevantAddrs(spec), addr)
 }
 
 var errKeyregTxnFirstVotingRoundGreaterThanLastVotingRound = errors.New("transaction first voting round need to be less than its last voting round")
@@ -316,8 +371,8 @@ func (tx Transaction) WellFormed(spec SpecialAddresses, proto config.ConsensusPa
 			}
 
 			// The trio of [VotePK, SelectionPK, VoteKeyDilution] needs to be all zeros or all non-zero for the transaction to be valid.
-			if !((tx.KeyregTxnFields.VotePK == crypto.OneTimeSignatureVerifier{} && tx.KeyregTxnFields.SelectionPK == crypto.VRFVerifier{} && tx.KeyregTxnFields.VoteKeyDilution == 0) ||
-				(tx.KeyregTxnFields.VotePK != crypto.OneTimeSignatureVerifier{} && tx.KeyregTxnFields.SelectionPK != crypto.VRFVerifier{} && tx.KeyregTxnFields.VoteKeyDilution != 0)) {
+			if !((tx.KeyregTxnFields.VotePK.IsEmpty() && tx.KeyregTxnFields.SelectionPK.IsEmpty() && tx.KeyregTxnFields.VoteKeyDilution == 0) ||
+				(!tx.KeyregTxnFields.VotePK.IsEmpty() && !tx.KeyregTxnFields.SelectionPK.IsEmpty() && tx.KeyregTxnFields.VoteKeyDilution != 0)) {
 				return errKeyregTxnNonCoherentVotingKeys
 			}
 
@@ -346,7 +401,7 @@ func (tx Transaction) WellFormed(spec SpecialAddresses, proto config.ConsensusPa
 				// that type of transaction, it is invalid.
 				return errKeyregTxnUnsupportedSwitchToNonParticipating
 			}
-			suppliesNullKeys := tx.KeyregTxnFields.VotePK == crypto.OneTimeSignatureVerifier{} || tx.KeyregTxnFields.SelectionPK == crypto.VRFVerifier{}
+			suppliesNullKeys := tx.KeyregTxnFields.VotePK.IsEmpty() || tx.KeyregTxnFields.SelectionPK.IsEmpty()
 			if !suppliesNullKeys {
 				return errKeyregTxnGoingOnlineWithNonParticipating
 			}
@@ -475,6 +530,9 @@ func (tx Transaction) WellFormed(spec SpecialAddresses, proto config.ConsensusPa
 			if br.Index > uint64(len(tx.ForeignApps)) {
 				return fmt.Errorf("tx.Boxes[%d].Index is %d. Exceeds len(tx.ForeignApps)", i, br.Index)
 			}
+			if proto.EnableBoxRefNameError && len(br.Name) > proto.MaxAppKeyLen {
+				return fmt.Errorf("tx.Boxes[%d].Name too long, max len %d bytes", i, proto.MaxAppKeyLen)
+			}
 		}
 
 		if tx.LocalStateSchema.NumEntries() > proto.MaxLocalSchemaEntries {
@@ -513,6 +571,42 @@ func (tx Transaction) WellFormed(spec SpecialAddresses, proto config.ConsensusPa
 			return errLeaseMustBeZeroInStateproofTxn
 		}
 
+	case protocol.HeartbeatTx:
+		if !proto.Heartbeat {
+			return fmt.Errorf("heartbeat transaction not supported")
+		}
+
+		// If this is a free/cheap heartbeat, it must be very simple.
+		if tx.Fee.Raw < proto.MinTxnFee && tx.Group.IsZero() {
+			kind := "free"
+			if tx.Fee.Raw > 0 {
+				kind = "cheap"
+			}
+
+			if len(tx.Note) > 0 {
+				return fmt.Errorf("tx.Note is set in %s heartbeat", kind)
+			}
+			if tx.Lease != [32]byte{} {
+				return fmt.Errorf("tx.Lease is set in %s heartbeat", kind)
+			}
+			if !tx.RekeyTo.IsZero() {
+				return fmt.Errorf("tx.RekeyTo is set in %s heartbeat", kind)
+			}
+		}
+
+		if (tx.HbProof == crypto.HeartbeatProof{}) {
+			return errors.New("tx.HbProof is empty")
+		}
+		if (tx.HbSeed == committee.Seed{}) {
+			return errors.New("tx.HbSeed is empty")
+		}
+		if tx.HbVoteID.IsEmpty() {
+			return errors.New("tx.HbVoteID is empty")
+		}
+		if tx.HbKeyDilution == 0 {
+			return errors.New("tx.HbKeyDilution is zero")
+		}
+
 	default:
 		return fmt.Errorf("unknown tx type %v", tx.Type)
 	}
@@ -542,8 +636,12 @@ func (tx Transaction) WellFormed(spec SpecialAddresses, proto config.ConsensusPa
 		nonZeroFields[protocol.ApplicationCallTx] = true
 	}
 
-	if !tx.StateProofTxnFields.Empty() {
+	if !tx.StateProofTxnFields.MsgIsZero() {
 		nonZeroFields[protocol.StateProofTx] = true
+	}
+
+	if tx.HeartbeatTxnFields != nil {
+		nonZeroFields[protocol.HeartbeatTx] = true
 	}
 
 	for t, nonZero := range nonZeroFields {
@@ -621,7 +719,7 @@ func (tx Transaction) stateProofPKWellFormed(proto config.ConsensusParams) error
 		return nil
 	}
 
-	if tx.VotePK == (crypto.OneTimeSignatureVerifier{}) || tx.SelectionPK == (crypto.VRFVerifier{}) {
+	if tx.VotePK.IsEmpty() || tx.SelectionPK.IsEmpty() {
 		if !isEmpty {
 			return errKeyregTxnOfflineShouldBeEmptyStateProofPK
 		}
@@ -652,9 +750,8 @@ func (tx Header) Last() basics.Round {
 	return tx.LastValid
 }
 
-// RelevantAddrs returns the addresses whose balance records this transaction will need to access.
-// The header's default is to return just the sender and the fee sink.
-func (tx Transaction) RelevantAddrs(spec SpecialAddresses) []basics.Address {
+// relevantAddrs returns the addresses whose balance records this transaction will need to access.
+func (tx Transaction) relevantAddrs(spec SpecialAddresses) []basics.Address {
 	addrs := []basics.Address{tx.Sender, spec.FeeSink}
 
 	switch tx.Type {
@@ -671,6 +768,8 @@ func (tx Transaction) RelevantAddrs(spec SpecialAddresses) []basics.Address {
 		if !tx.AssetTransferTxnFields.AssetSender.IsZero() {
 			addrs = append(addrs, tx.AssetTransferTxnFields.AssetSender)
 		}
+	case protocol.HeartbeatTx:
+		addrs = append(addrs, tx.HeartbeatTxnFields.HbAddress)
 	}
 
 	return addrs

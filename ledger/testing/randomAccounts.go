@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2022 Algorand, Inc.
+// Copyright (C) 2019-2025 Algorand, Inc.
 // This file is part of go-algorand
 //
 // go-algorand is free software: you can redistribute it and/or modify
@@ -18,11 +18,9 @@ package testing
 
 import (
 	"fmt"
-	"math"
 
 	"github.com/algorand/go-algorand/config"
 	"github.com/algorand/go-algorand/crypto"
-	"github.com/algorand/go-algorand/crypto/merklesignature"
 	"github.com/algorand/go-algorand/data/basics"
 	"github.com/algorand/go-algorand/protocol"
 
@@ -33,6 +31,16 @@ import (
 
 var testPoolAddr = basics.Address{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}
 var testSinkAddr = basics.Address{0x2c, 0x2a, 0x6c, 0xe9, 0xa9, 0xa7, 0xc2, 0x8c, 0x22, 0x95, 0xfd, 0x32, 0x4f, 0x77, 0xa5, 0x4, 0x8b, 0x42, 0xc2, 0xb7, 0xa8, 0x54, 0x84, 0xb6, 0x80, 0xb1, 0xe1, 0x3d, 0x59, 0x9b, 0xeb, 0x36}
+
+// PoolAddr returns a copy of the test pool address
+func PoolAddr() basics.Address {
+	return testPoolAddr
+}
+
+// SinkAddr returns a copy of the test sink address
+func SinkAddr() basics.Address {
+	return testSinkAddr
+}
 
 // RandomAddress generates a random address
 func RandomAddress() basics.Address {
@@ -48,49 +56,64 @@ func RandomNote() []byte {
 	return note[:]
 }
 
-// RandomAccountData generates a random AccountData
+// RandomAccountData generates a random AccountData with no associated resources.
 func RandomAccountData(rewardsBase uint64) basics.AccountData {
 	var data basics.AccountData
 
 	// Avoid overflowing totals
 	data.MicroAlgos.Raw = crypto.RandUint64() % (1 << 32)
+	// 0 is an invalid round, but would be right if never proposed
+	data.LastProposed = basics.Round(crypto.RandUint64() % 10)
+	// 0 is an invalid round, but would be right if never needed a heartbeat
+	data.LastHeartbeat = basics.Round(crypto.RandUint64() % 10)
 
 	switch crypto.RandUint64() % 3 {
 	case 0:
 		data.Status = basics.Online
-		data.VoteLastValid = 10000
+		data.IncentiveEligible = crypto.RandUint64()%5 == 0
 	case 1:
 		data.Status = basics.Offline
-		data.VoteLastValid = 0
-	default:
+	case 2:
 		data.Status = basics.NotParticipating
 	}
 
-	data.VoteFirstValid = 0
+	// Give online accounts voting data, and some of the offline too. They are "suspended".
+	if data.Status == basics.Online || (data.Status == basics.Offline && crypto.RandUint64()%5 == 1) {
+		crypto.RandBytes(data.VoteID[:])
+		crypto.RandBytes(data.SelectionID[:])
+		crypto.RandBytes(data.StateProofID[:])
+		data.VoteFirstValid = basics.Round(crypto.RandUint64())
+		data.VoteLastValid = basics.Round(crypto.RandUint63()) // int64 is the max sqlite can store
+		data.VoteKeyDilution = crypto.RandUint64()
+	}
+
 	data.RewardsBase = rewardsBase
 	return data
 }
 
 // RandomOnlineAccountData is similar to RandomAccountData but always creates online account
 func RandomOnlineAccountData(rewardsBase uint64) basics.AccountData {
-	var data basics.AccountData
-	data.MicroAlgos.Raw = crypto.RandUint64() % (1 << 32)
-	data.Status = basics.Online
-	data.VoteLastValid = 1000
-	data.VoteFirstValid = 0
-	data.RewardsBase = rewardsBase
-	return data
+	for {
+		data := RandomAccountData(rewardsBase)
+		if data.Status == basics.Online {
+			return data
+		}
+	}
 }
 
-// RandomAssetParams creates a randim basics.AssetParams
+// RandomAssetParams creates a random basics.AssetParams
 func RandomAssetParams() basics.AssetParams {
 	ap := basics.AssetParams{
 		Total:         crypto.RandUint64(),
 		Decimals:      uint32(crypto.RandUint64() % 20),
 		DefaultFrozen: crypto.RandUint64()%2 == 0,
 	}
+	// Since 0 and 1 Total assets seem extra interesting, make them more often.
 	if crypto.RandUint64()%5 != 0 {
-		ap.UnitName = fmt.Sprintf("un%x", uint32(crypto.RandUint64()%0x7fffffff))
+		ap.Total = crypto.RandUint64() % 2
+	}
+	if crypto.RandUint64()%5 != 0 {
+		ap.UnitName = fmt.Sprintf("un%x", uint32(crypto.RandUint64()%0x7fffff))
 	}
 	if crypto.RandUint64()%5 != 0 {
 		ap.AssetName = fmt.Sprintf("an%x", uint32(crypto.RandUint64()%0x7fffffff))
@@ -204,6 +227,7 @@ func RandomAppParams() basics.AppParams {
 	if len(ap.GlobalState) == 0 {
 		ap.GlobalState = nil
 	}
+	ap.ExtraProgramPages = uint32(crypto.RandUint64() % 4)
 	return ap
 }
 
@@ -258,21 +282,6 @@ func RandomAppLocalState() basics.AppLocalState {
 func RandomFullAccountData(rewardsLevel uint64, lastCreatableID *basics.CreatableIndex, assets map[basics.AssetIndex]struct{}, apps map[basics.AppIndex]struct{}) basics.AccountData {
 	data := RandomAccountData(rewardsLevel)
 
-	if data.Status == basics.Online {
-		crypto.RandBytes(data.VoteID[:])
-		crypto.RandBytes(data.SelectionID[:])
-		crypto.RandBytes(data.StateProofID[:])
-		data.VoteFirstValid = basics.Round(crypto.RandUint64())
-		data.VoteLastValid = basics.Round(crypto.RandUint64() % uint64(math.MaxInt64)) // int64 is the max sqlite can store
-		data.VoteKeyDilution = crypto.RandUint64()
-	} else {
-		data.VoteID = crypto.OneTimeSignatureVerifier{}
-		data.SelectionID = crypto.VRFVerifier{}
-		data.StateProofID = merklesignature.Commitment{}
-		data.VoteFirstValid = 0
-		data.VoteLastValid = 0
-		data.VoteKeyDilution = 0
-	}
 	if (crypto.RandUint64() % 2) == 1 {
 		// if account has created assets, have these defined.
 		createdAssetsCount := crypto.RandUint64()%20 + 1
